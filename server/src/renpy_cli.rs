@@ -83,8 +83,30 @@ pub fn find_sdk() -> Option<PathBuf> {
     candidates.pop()
 }
 
-/// The Ren'Py project base directory (the one containing `game/`) at or above
-/// `start`, if any.
+/// Directories never worth descending into while looking for a project.
+const PROJECT_SCAN_SKIP: &[&str] = &["node_modules", "target", "cache", "saves", "tmp"];
+
+fn subdirectories(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            !name.starts_with('.')
+                && !PROJECT_SCAN_SKIP.contains(&name.as_str())
+                && entry.file_type().is_ok_and(|t| t.is_dir())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The Ren'Py project base directory (the one containing `game/`): `start`
+/// itself, an ancestor (a folder inside the project was opened), or — for
+/// repositories that nest the project (`repo/renpy_project/game/`) — the
+/// shallowest match up to two levels below `start`. Shallowest-first keeps
+/// built distributions and other deep copies from shadowing the real project.
 pub fn find_project(start: &Path) -> Option<PathBuf> {
     if start.join("game").is_dir() {
         return Some(start.to_path_buf());
@@ -93,6 +115,19 @@ pub fn find_project(start: &Path) -> Option<PathBuf> {
     for ancestor in start.ancestors().skip(1) {
         if ancestor.join("game").is_dir() {
             return Some(ancestor.to_path_buf());
+        }
+    }
+    let children = subdirectories(start);
+    for child in &children {
+        if child.join("game").is_dir() {
+            return Some(child.clone());
+        }
+    }
+    for child in &children {
+        for grandchild in subdirectories(child) {
+            if grandchild.join("game").is_dir() {
+                return Some(grandchild);
+            }
         }
     }
     None
@@ -220,5 +255,21 @@ mod tests {
         assert_eq!(find_project(&game), Some(base.clone()));
         assert_eq!(find_project(&game.join("sub")), Some(base.clone()));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn finds_project_nested_below_a_repo_root() {
+        let base = std::env::temp_dir().join(format!("renpy-cli-nested-{}", std::process::id()));
+        // repo/renpy_project/game plus a deeper decoy that must not win.
+        std::fs::create_dir_all(base.join("renpy_project").join("game")).unwrap();
+        std::fs::create_dir_all(base.join("zz_dists").join("built").join("game")).unwrap();
+        std::fs::create_dir_all(base.join("misc")).unwrap();
+        assert_eq!(find_project(&base), Some(base.join("renpy_project")));
+        // Two levels down still resolves when it is the only project.
+        let deep = std::env::temp_dir().join(format!("renpy-cli-deep-{}", std::process::id()));
+        std::fs::create_dir_all(deep.join("apps").join("vn").join("game")).unwrap();
+        assert_eq!(find_project(&deep), Some(deep.join("apps").join("vn")));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&deep);
     }
 }
