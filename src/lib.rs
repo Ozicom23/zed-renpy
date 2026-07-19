@@ -9,6 +9,25 @@ struct RenpyExtension {
     cached_binary_path: Option<String>,
 }
 
+/// The newest previously-downloaded server binary in the extension work dir,
+/// if any (version dirs are named `renpy-language-server-<tag>`).
+fn newest_cached_binary(binary_name: &str) -> Option<String> {
+    let mut candidates: Vec<String> = fs::read_dir(".")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.file_name().to_string_lossy().to_string();
+            if !dir.starts_with(BINARY_NAME) {
+                return None;
+            }
+            let path = format!("{dir}/{binary_name}");
+            fs::metadata(&path).is_ok_and(|m| m.is_file()).then_some(path)
+        })
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+
 impl RenpyExtension {
     /// Resolution order: explicit path in Zed settings, then PATH, then a
     /// binary auto-downloaded from this repo's GitHub releases (cached in the
@@ -45,16 +64,35 @@ impl RenpyExtension {
             }
         }
 
+        let (platform, arch) = zed::current_platform();
+        let binary_name = match platform {
+            zed::Os::Windows => format!("{BINARY_NAME}.exe"),
+            _ => BINARY_NAME.to_string(),
+        };
+
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
-        let release = zed::latest_github_release(
+        let release = match zed::latest_github_release(
             GITHUB_REPO,
             zed::GithubReleaseOptions { require_assets: true, pre_release: false },
-        )?;
-
-        let (platform, arch) = zed::current_platform();
+        ) {
+            Ok(release) => release,
+            Err(err) => {
+                // Offline or rate-limited: fall back to the newest binary we
+                // downloaded on an earlier run, if any.
+                if let Some(path) = newest_cached_binary(&binary_name) {
+                    zed::set_language_server_installation_status(
+                        language_server_id,
+                        &zed::LanguageServerInstallationStatus::None,
+                    );
+                    self.cached_binary_path = Some(path.clone());
+                    return Ok(zed::Command { command: path, args: Vec::new(), env: Default::default() });
+                }
+                return Err(format!("failed to check for a renpy-language-server release: {err}"));
+            }
+        };
         let target = match (platform, arch) {
             (zed::Os::Mac, zed::Architecture::Aarch64) => "aarch64-apple-darwin",
             (zed::Os::Mac, _) => "x86_64-apple-darwin",
@@ -74,10 +112,6 @@ impl RenpyExtension {
             .ok_or_else(|| format!("release {} has no asset {asset_name}", release.version))?;
 
         let version_dir = format!("{BINARY_NAME}-{}", release.version);
-        let binary_name = match platform {
-            zed::Os::Windows => format!("{BINARY_NAME}.exe"),
-            _ => BINARY_NAME.to_string(),
-        };
         let binary_path = format!("{version_dir}/{binary_name}");
 
         if !fs::metadata(&binary_path).is_ok_and(|meta| meta.is_file()) {
