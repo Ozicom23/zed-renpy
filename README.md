@@ -19,6 +19,7 @@ Ren'Py visual novel script support for the [Zed](https://zed.dev) editor: syntax
 - **Rename labels** (F2): the definition and every `jump`/`call` update in one atomic edit across files; renaming onto an existing label or a non-label is refused.
 - **Hover documentation**: your own symbols show their definition line plus any `#` comment block above it; Ren'Py built-ins (`Transform`, `Character`, `renpy.*`, `config.*`, …) show their signature and API docs from a bundled dataset of 1100+ entries targeting **Ren'Py 8.3** (each popup states this), plus a direct link to that symbol's page in the official documentation.
 - **Run the game from the editor** via Zed's debugger: launch configurations start your project through the Ren'Py SDK, stream its output into the debug console, and stop it with the stop button — including **warp-to-cursor**, which boots the game directly at the line you're editing.
+- **Real debugging** (Ren'Py 8.2+): breakpoints on **dialogue, menu, jump — any Ren'Py statement** — *and* inside `python:` blocks, `init python:` and `$` lines. Step over/into/out at both statement and python-line granularity, inspect locals and the entire Ren'Py store in the Variables panel, walk the call stack (python frames + Ren'Py call stack), and evaluate expressions against the live game from the debug console.
 - **Engine lint as diagnostics**: on every save, `renpy lint` runs against your project (when an SDK is available) and its findings — missing images, undefined characters, and every other engine-level check — appear as warnings in the editor, merged with the built-in diagnostics.
 
 ## Installation
@@ -79,7 +80,18 @@ Start one from the debug panel (`f4` / `debugger: start`). The `warp` configurat
 
 How the SDK is found, in order: the `"sdk"` field in the configuration → the `RENPY_SDK` environment variable → a `renpy-*-sdk` directory in your home, `Documents`, `Downloads`, or `Desktop` folder (newest version wins). The project defaults to the worktree root; set `"project"` if your `game/` directory lives elsewhere. Other optional fields: `"command"` (default `run` — try `lint` or `compile`), `"args"`, and `"env"` (e.g. `{"RENPY_SKIP_SPLASHSCREEN": "1"}`).
 
-Breakpoints are accepted but reported as unverified for now — real breakpoint support (inside `python:` blocks first, then on Ren'Py statements) is in development.
+### Breakpoints, stepping, variables
+
+Debug sessions inject a small agent (`game/zed_debug.rpe.py`, written on launch and deleted when the session ends; Ren'Py never includes `.rpe*` files in built distributions) that talks to Zed over a loopback socket. It is inert without the session's environment variables, so a stray leftover file does nothing. With it you get:
+
+- **Breakpoints on Ren'Py statements** — a say line, `menu`, `jump`, `show`, anything. The game pauses *before* the statement runs.
+- **Breakpoints inside python** — `python:` / `init python:` blocks (including during startup) and `$` lines.
+- **Stepping**: *step over* stops at the next statement at the same call depth (or next python line in the same frame); *step in* stops wherever execution goes next, entering python blocks; *step out* runs to the calling label / python caller.
+- **Variables**: python locals for the selected frame plus the whole Ren'Py store (your `define`/`default` variables and everything the game has set), with expandable objects and collections.
+- **Call stack**: python frames inside `.rpy` files, the current Ren'Py statement, and the label call stack.
+- **Debug console**: evaluate any expression against the paused game (python frame scope when paused in python, the store otherwise).
+
+Notes: pausing (the ⏸ button) takes effect at the next executed statement — while the game idles waiting for a click, nothing is executing, so advance the game once for the pause to land. Breakpoints on lines that aren't executable statements simply never hit. Requires Ren'Py 8.2+ (the `.rpe.py` extension mechanism); on older engines the game runs normally and a console message notes that breakpoints are inactive.
 
 ## Engine lint on save
 

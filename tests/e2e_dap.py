@@ -118,9 +118,9 @@ rid = dap.send("setBreakpoints", {
 resp = dap.response(rid)
 bps = resp.get("body", {}).get("breakpoints", [])
 check(
-    "breakpoints acknowledged unverified",
+    "breakpoints acknowledged verified",
     resp.get("success") is True and len(bps) == 2
-    and all(b.get("verified") is False for b in bps),
+    and all(b.get("verified") is True for b in bps),
     json.dumps(resp),
 )
 
