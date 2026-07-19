@@ -1,13 +1,21 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
-  "additionalProperties": false,
   "required": ["request"],
   "properties": {
+    "adapter": {
+      "type": "string",
+      "description": "The debug adapter to use — \"renpy\" for these configurations."
+    },
+    "label": {
+      "type": "string",
+      "description": "Name of this configuration, shown in the debugger's session picker."
+    },
     "request": {
       "type": "string",
       "enum": ["launch"],
-      "description": "Only \"launch\" is supported for Ren'Py (attach arrives with in-game debugging)."
+      "default": "launch",
+      "description": "Only \"launch\" is supported for Ren'Py (attach arrives with a future release)."
     },
     "sdk": {
       "type": "string",
@@ -28,12 +36,22 @@
     "args": {
       "type": "array",
       "items": { "type": "string" },
+      "default": [],
       "description": "Extra arguments appended to the Ren'Py command line."
     },
     "env": {
       "type": "object",
       "additionalProperties": { "type": "string" },
+      "default": {},
       "description": "Environment variables for the game process, e.g. {\"RENPY_SKIP_SPLASHSCREEN\": \"1\"}."
+    },
+    "build": {
+      "type": ["string", "object"],
+      "description": "A Zed task (label or template) to run before launching."
+    },
+    "tcp_connection": {
+      "type": "object",
+      "description": "Standard Zed field; not used by the Ren'Py adapter (it speaks stdio)."
     }
   }
 }
