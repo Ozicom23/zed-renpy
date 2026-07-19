@@ -1,0 +1,23 @@
+{
+  "name": "tree-sitter-renpy",
+  "version": "1.0.0",
+  "description": "Grammar for Ren'Py Zed extension.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZeynTheDev/tree-sitter-renpy.git"
+  },
+  "keywords": [],
+  "author": "ZeynTheDev",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/ZeynTheDev/tree-sitter-renpy/issues"
+  },
+  "homepage": "https://github.com/ZeynTheDev/tree-sitter-renpy#readme",
+  "devDependencies": {
+    "tree-sitter": "^0.25.0"
+  }
+}
