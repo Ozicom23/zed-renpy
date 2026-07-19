@@ -419,6 +419,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                     json!({
                         "supportsConfigurationDoneRequest": true,
                         "supportsTerminateRequest": true,
+                        "supportsSetVariable": true,
                     }),
                 );
                 writer.event("initialized", json!({}));
@@ -696,6 +697,28 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                         writer.respond(&request, json!({ "variables": variables }));
                     }
                     Err(_) => writer.respond(&request, json!({ "variables": [] })),
+                }
+            }
+            "setVariable" => {
+                let arguments = &request["arguments"];
+                match bridge.agent_request(json!({
+                    "cmd": "set_variable",
+                    "ref": arguments["variablesReference"],
+                    "name": arguments["name"],
+                    "value": arguments["value"],
+                })) {
+                    Ok(reply) => {
+                        let variable = &reply["variable"];
+                        writer.respond(
+                            &request,
+                            json!({
+                                "value": variable["value"],
+                                "type": variable["type"],
+                                "variablesReference": variable["ref"],
+                            }),
+                        );
+                    }
+                    Err(message) => writer.fail(&request, message),
                 }
             }
             "evaluate" => {

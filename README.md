@@ -87,9 +87,9 @@ Debug sessions inject a small agent (`game/zed_debug.rpe.py`, written on launch 
 - **Breakpoints on Ren'Py statements** — a say line, `menu`, `jump`, `show`, anything. The game pauses *before* the statement runs.
 - **Breakpoints inside python** — `python:` / `init python:` blocks (including during startup) and `$` lines.
 - **Stepping**: *step over* stops at the next statement at the same call depth (or next python line in the same frame); *step in* stops wherever execution goes next, entering python blocks; *step out* runs to the calling label / python caller.
-- **Variables**: python locals for the selected frame plus the whole Ren'Py store (your `define`/`default` variables and everything the game has set), with expandable objects and collections.
+- **Variables**: python locals for the selected frame plus the whole Ren'Py store (your `define`/`default` variables and everything the game has set), with expandable objects and collections. Values are **editable** — change a variable in the panel and the game continues with the new value. (Function-frame locals are read-only on Python 3.12, i.e. Ren'Py ≤ 8.5; script-level python and the store are always writable.)
 - **Call stack**: python frames inside `.rpy` files, the current Ren'Py statement, and the label call stack.
-- **Debug console**: evaluate any expression against the paused game (python frame scope when paused in python, the store otherwise).
+- **Debug console**: evaluate any expression against the paused game (python frame scope when paused in python, the store otherwise) — and run statements too: `points = 100` or `inventory.append("sword")` take effect immediately. The value you type for a variable edit is a full Python expression, so `points + 50` or `[1, 2, 3]` work.
 
 Notes: pausing (the ⏸ button) takes effect at the next executed statement — while the game idles waiting for a click, nothing is executing, so advance the game once for the pause to land. Breakpoints on lines that aren't executable statements simply never hit. Requires Ren'Py 8.2+ (the `.rpe.py` extension mechanism); on older engines the game runs normally and a console message notes that breakpoints are inactive.
 

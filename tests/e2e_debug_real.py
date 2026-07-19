@@ -188,6 +188,18 @@ resp = response(rid)
 check("evaluate in paused frame", resp.get("success") and resp["body"]["result"] == "101",
       json.dumps(resp))
 
+# --- modify a variable before the line using it runs
+locals_ref = next((s["variablesReference"] for s in scopes if s["name"] == "Locals"), None)
+rid = send("setVariable", {
+    "variablesReference": locals_ref, "name": "zz_test_alpha", "value": "100",
+})
+resp = response(rid)
+check(
+    "setVariable updates the value",
+    resp.get("success") and resp["body"]["value"] == "100",
+    json.dumps(resp),
+)
+
 # --- step: next python line in the same block
 rid = send("next", {"threadId": 1})
 response(rid)
@@ -195,6 +207,29 @@ stop = next_stopped()
 check("step stops", stop is not None and stop["body"]["reason"] == "step", json.dumps(stop))
 frames = stack()
 check("step landed on line 4", frames and frames[0]["line"] == 4, json.dumps(frames[:1]))
+
+# line 3 (zz_test_beta = zz_test_alpha + 1) ran with the modified alpha
+rid = send("evaluate", {"expression": "zz_test_beta", "context": "repl"})
+resp = response(rid)
+check(
+    "modified variable affected execution",
+    resp.get("success") and resp["body"]["result"] == "101",
+    json.dumps(resp),
+)
+rid = send("evaluate", {"expression": "zz_console = 7", "context": "repl"})
+resp = response(rid)
+check(
+    "console executes assignment statements",
+    resp.get("success") and resp["body"]["result"] == "(executed)",
+    json.dumps(resp),
+)
+rid = send("evaluate", {"expression": "zz_console", "context": "repl"})
+resp = response(rid)
+check(
+    "console assignment persisted",
+    resp.get("success") and resp["body"]["result"] == "7",
+    json.dumps(resp),
+)
 
 # --- stop 2: statement breakpoint on the splashscreen $ line
 rid = send("continue", {"threadId": 1})
@@ -224,6 +259,29 @@ rid = send("evaluate", {"expression": "zz_splash", "context": "repl"})
 resp = response(rid)
 check("evaluate against the store", resp.get("success") and resp["body"]["result"] == "42",
       json.dumps(resp))
+
+# --- modify a store variable at a statement pause (writes through the view)
+rid = send("scopes", {"frameId": 0})
+store_ref = next(
+    (s["variablesReference"] for s in response(rid)["body"]["scopes"] if s["name"] == "Store"),
+    None,
+)
+rid = send("setVariable", {
+    "variablesReference": store_ref, "name": "zz_splash", "value": "1000",
+})
+resp = response(rid)
+check(
+    "setVariable writes through to the store",
+    resp.get("success") and resp["body"]["value"] == "1000",
+    json.dumps(resp),
+)
+rid = send("evaluate", {"expression": "zz_splash", "context": "repl"})
+resp = response(rid)
+check(
+    "store modification visible to evaluate",
+    resp.get("success") and resp["body"]["result"] == "1000",
+    json.dumps(resp),
+)
 
 # --- run on, then shut everything down
 rid = send("continue", {"threadId": 1})

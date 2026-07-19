@@ -49,8 +49,11 @@ class Agent(object):
         self.commands_ready = threading.Event()
         self.paused = False
         self.configured = threading.Event()
-        # Variable reference registry, valid for one pause.
+        # Variable reference registry, valid for one pause. ref_targets
+        # maps a ref to the object writes should go to (None = read-only
+        # view, e.g. a function frame's locals snapshot on Python < 3.13).
         self.refs = {}
+        self.ref_targets = {}
         self.next_ref = 1
         # A stable bound-method reference: sys.gettrace() identity checks fail
         # against `self.trace` because attribute access creates a new bound
@@ -107,10 +110,10 @@ class Agent(object):
             self.pause_requested = True
             self.reply(msg, {"ok": True})
         elif cmd in ("continue", "next", "step_in", "step_out", "stack",
-                     "scopes", "variables", "evaluate"):
+                     "scopes", "variables", "evaluate", "set_variable"):
             if self.paused:
                 self.enqueue(msg)
-            elif cmd in ("stack", "scopes", "variables", "evaluate"):
+            elif cmd in ("stack", "scopes", "variables", "evaluate", "set_variable"):
                 self.reply(msg, {"error": "not stopped"})
             else:
                 self.reply(msg, {"ok": True})
@@ -233,6 +236,7 @@ class Agent(object):
         self.pause_requested = False
         self.step_mode = None
         self.refs = {}
+        self.ref_targets = {}
         self.next_ref = 1
         stack = self.build_stack(frame)
         top = stack[0] if stack else {"file": "unknown", "line": 0}
@@ -260,6 +264,10 @@ class Agent(object):
                     self.reply(msg, {"variables": self.expand_ref(msg.get("ref") or 0)})
                 elif cmd == "evaluate":
                     self.reply(msg, self.evaluate(msg.get("expr") or ""))
+                elif cmd == "set_variable":
+                    self.reply(msg, self.set_variable(
+                        msg.get("ref") or 0, msg.get("name") or "",
+                        msg.get("value") or "None"))
                 elif cmd in ("continue", "next", "step_in", "step_out"):
                     self.reply(msg, {"ok": True})
                     resume = cmd
@@ -344,7 +352,17 @@ class Agent(object):
         py_frames = getattr(self, "_py_frames", [])
         if frame_index < len(py_frames):
             f = py_frames[frame_index]
-            scopes.append({"name": "Locals", "ref": self.register(dict(f.f_locals))})
+            if f.f_code.co_name == "<module>":
+                # Module-style frames (init python, python:, $) expose their
+                # real namespace — edits take effect.
+                scopes.append({"name": "Locals", "ref": self.register(f.f_locals)})
+            else:
+                # CPython < 3.13: function locals are snapshots; show them
+                # but refuse writes rather than silently dropping them.
+                scopes.append({
+                    "name": "Locals",
+                    "ref": self.register(dict(f.f_locals), target=None),
+                })
         try:
             import renpy
             store = renpy.python.store_dicts["store"]
@@ -356,15 +374,16 @@ class Agent(object):
                 if type(value).__name__ in ("module", "function", "type", "builtin_function_or_method"):
                     continue
                 visible[key] = value
-            scopes.append({"name": "Store", "ref": self.register(visible)})
+            scopes.append({"name": "Store", "ref": self.register(visible, target=store)})
         except Exception:
             pass
         return scopes
 
-    def register(self, obj):
+    def register(self, obj, target="same"):
         ref = self.next_ref
         self.next_ref += 1
         self.refs[ref] = obj
+        self.ref_targets[ref] = obj if target == "same" else target
         return ref
 
     def expand_ref(self, ref):
@@ -410,19 +429,60 @@ class Agent(object):
             "ref": ref,
         }
 
+    def _eval(self, expr):
+        py_frames = getattr(self, "_py_frames", [])
+        if py_frames:
+            f = py_frames[0]
+            return eval(expr, f.f_globals, f.f_locals)
+        import renpy
+        return renpy.python.py_eval(expr)
+
     def evaluate(self, expr):
         try:
-            py_frames = getattr(self, "_py_frames", [])
-            if py_frames:
-                f = py_frames[0]
-                value = eval(expr, f.f_globals, dict(f.f_locals))
-            else:
-                import renpy
-                value = renpy.python.py_eval(expr)
+            try:
+                value = self._eval(expr)
+            except SyntaxError:
+                # Not an expression — execute it as a statement (assignments,
+                # calls with side effects) in the same scope.
+                py_frames = getattr(self, "_py_frames", [])
+                if py_frames:
+                    f = py_frames[0]
+                    exec(expr, f.f_globals, f.f_locals)
+                else:
+                    import renpy
+                    renpy.python.py_exec(expr)
+                return {"value": "(executed)", "type": "", "ref": 0}
             result = self.variable("result", value)
             return {"value": result["value"], "type": result["type"], "ref": result["ref"]}
         except Exception as e:
             return {"error": "%s: %s" % (type(e).__name__, e)}
+
+    def set_variable(self, ref, name, value_expr):
+        target = self.ref_targets.get(ref)
+        if target is None:
+            return {"error": "this scope is read-only here (function locals "
+                             "cannot be modified on this Python version)"}
+        try:
+            value = self._eval(value_expr)
+        except Exception as e:
+            return {"error": "%s: %s" % (type(e).__name__, e)}
+        try:
+            if isinstance(target, dict):
+                target[name] = value
+            elif isinstance(target, list):
+                index = int(name.strip("[]"))
+                target[index] = value
+            elif isinstance(target, tuple):
+                return {"error": "tuples are immutable"}
+            else:
+                setattr(target, name, value)
+        except Exception as e:
+            return {"error": "%s: %s" % (type(e).__name__, e)}
+        # Keep the displayed view in sync when it is a separate copy.
+        display = self.refs.get(ref)
+        if isinstance(display, dict) and display is not target:
+            display[name] = value
+        return {"variable": self.variable(name, value)}
 
 
 def normalize(filename):
