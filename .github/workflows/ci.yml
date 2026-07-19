@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit tests
+        run: cargo test --manifest-path server/Cargo.toml
+      - name: Build server (release)
+        run: cargo build --release --manifest-path server/Cargo.toml
+      - name: End-to-end LSP protocol test
+        run: python3 tests/e2e_lsp.py
+      - name: Extension glue compiles for wasm32-wasip2
+        run: |
+          rustup target add wasm32-wasip2
+          cargo build --release --target wasm32-wasip2

@@ -1,0 +1,16 @@
+[package]
+name = "renpy-language-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A minimal language server for Ren'Py visual novel scripts: workspace-wide go-to-definition and symbol search"
+repository = "https://github.com/Ozicom23/zed-renpy"
+
+[dependencies]
+lsp-server = "0.7"
+lsp-types = "0.95"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+strip = true
