@@ -1,7 +1,7 @@
 id = "renpy"
 name = "Ren'Py"
-description = "Ren'Py visual novel script syntax highlighting for Zed"
-version = "0.1.0"
+description = "Ren'Py visual novel script support for Zed: highlighting, language intelligence, engine lint, and game launching"
+version = "0.2.0"
 schema_version = 1
 authors = ["Denys Berezovskyi <berezovskyidenys@gmail.com>"]
 repository = "https://github.com/Ozicom23/zed-renpy"
@@ -9,6 +9,8 @@ repository = "https://github.com/Ozicom23/zed-renpy"
 [language_servers.renpy-language-server]
 name = "Ren'Py Language Server"
 languages = ["Ren'Py"]
+
+[debug_adapters.renpy]
 
 [grammars.renpy]
 repository = "https://github.com/Ozicom23/zed-renpy"

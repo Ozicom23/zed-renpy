@@ -233,6 +233,7 @@ dependencies = [
 name = "renpy-language-server"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "lsp-server",
  "lsp-types",
  "serde",

@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["request"],
+  "properties": {
+    "request": {
+      "type": "string",
+      "enum": ["launch"],
+      "description": "Only \"launch\" is supported for Ren'Py (attach arrives with in-game debugging)."
+    },
+    "sdk": {
+      "type": "string",
+      "description": "Path to the Ren'Py SDK directory (the one containing renpy.sh / renpy.py). Optional when $RENPY_SDK is set or a renpy-*-sdk directory sits in your home, Documents, Downloads, or Desktop folder."
+    },
+    "project": {
+      "type": "string",
+      "description": "Ren'Py project base directory (the one containing game/). Defaults to the worktree root."
+    },
+    "warp": {
+      "type": "string",
+      "description": "Start the game warped to this file:line, e.g. \"game/script.rpy:42\" or \"$ZED_FILE:$ZED_ROW\" to start at the cursor. Requires config.developer = True (the default while developing)."
+    },
+    "command": {
+      "type": "string",
+      "description": "Ren'Py CLI command to execute; defaults to \"run\". Other useful values: \"lint\", \"compile\"."
+    },
+    "args": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Extra arguments appended to the Ren'Py command line."
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Environment variables for the game process, e.g. {\"RENPY_SKIP_SPLASHSCREEN\": \"1\"}."
+    }
+  }
+}

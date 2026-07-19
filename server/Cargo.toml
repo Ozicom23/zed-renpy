@@ -7,6 +7,7 @@ description = "A minimal language server for Ren'Py visual novel scripts: worksp
 repository = "https://github.com/Ozicom23/zed-renpy"
 
 [dependencies]
+crossbeam-channel = "0.5"
 lsp-server = "0.7"
 lsp-types = "0.95"
 serde = { version = "1", features = ["derive"] }

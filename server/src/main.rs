@@ -9,6 +9,9 @@
 //! Parsing is line-based: Ren'Py definition statements always start a line, so a
 //! full AST is unnecessary for indexing declaration sites.
 
+mod dap;
+mod renpy_cli;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +23,8 @@ use lsp_types::{
     HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent, MarkupKind,
     OneOf, Position, PublishDiagnosticsParams, Range, ReferenceParams, RenameParams,
     ServerCapabilities, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextEdit, Url, WorkspaceEdit, WorkspaceSymbolParams,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
+    WorkspaceEdit, WorkspaceSymbolParams,
 };
 
 #[derive(Clone)]
@@ -781,12 +785,98 @@ fn rename_edits(
     Ok(changes)
 }
 
+/// Runs `renpy lint` off-thread on demand, at most one at a time; a save that
+/// arrives mid-run queues exactly one follow-up.
+struct LintRunner {
+    enabled: bool,
+    sdk: Option<PathBuf>,
+    project: Option<PathBuf>,
+    running: bool,
+    pending: bool,
+    tx: crossbeam_channel::Sender<Result<String, String>>,
+}
+
+impl LintRunner {
+    fn request(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let (Some(sdk), Some(project)) = (&self.sdk, &self.project) else { return };
+        if self.running {
+            self.pending = true;
+            return;
+        }
+        let Some(invocation) = renpy_cli::sdk_invocation(sdk) else { return };
+        self.running = true;
+        let project = project.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let output = std::process::Command::new(&invocation.program)
+                .args(&invocation.prefix_args)
+                .arg(&project)
+                .arg("lint")
+                .stdin(std::process::Stdio::null())
+                .output();
+            let outcome = match output {
+                Ok(output) if output.status.success() => {
+                    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+                }
+                Ok(output) => Err(format!(
+                    "renpy lint failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(err) => Err(format!("could not run renpy lint: {err}")),
+            };
+            eprintln!(
+                "renpy-language-server: renpy lint finished in {:.1}s",
+                started.elapsed().as_secs_f32()
+            );
+            let _ = tx.send(outcome);
+        });
+    }
+}
+
+/// Lint problems as LSP diagnostics. The end column is deliberately past any
+/// real line length: per the LSP spec, clients clamp it to the line end, which
+/// underlines the whole line (lint has no column information).
+fn lint_diagnostics(project: &Path, report: &str) -> HashMap<Url, Vec<Diagnostic>> {
+    let mut out: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+    for problem in renpy_cli::parse_lint_report(report) {
+        let Ok(uri) = Url::from_file_path(project.join(&problem.path)) else { continue };
+        out.entry(uri).or_default().push(Diagnostic {
+            range: Range {
+                start: Position { line: problem.line, character: 0 },
+                end: Position { line: problem.line, character: u32::MAX },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            source: Some("renpy lint".into()),
+            message: problem.message,
+            ..Default::default()
+        });
+    }
+    out
+}
+
 fn publish_diagnostics(
     connection: &Connection,
     index: &Index,
+    lint_diags: &HashMap<Url, Vec<Diagnostic>>,
     previously: &mut std::collections::HashSet<Url>,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let current = index.compute_diagnostics();
+    let mut current = index.compute_diagnostics();
+    // Merge lint findings, except on lines the indexer already flagged (both
+    // tools report undefined jump targets; ours has the more precise range).
+    for (uri, diags) in lint_diags {
+        let entry = current.entry(uri.clone()).or_default();
+        for diag in diags {
+            if entry.iter().any(|existing| existing.range.start.line == diag.range.start.line) {
+                continue;
+            }
+            entry.push(diag.clone());
+        }
+    }
     let cleared: Vec<Url> = previously
         .iter()
         .filter(|uri| !current.contains_key(uri))
@@ -812,10 +902,34 @@ fn publish_diagnostics(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    match std::env::args().nth(1).as_deref() {
+        Some("dap") => return dap::run(),
+        Some("--version") | Some("-V") => {
+            println!("renpy-language-server {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(other) => {
+            eprintln!(
+                "renpy-language-server: unknown argument '{other}' \
+                 (no arguments = language server, 'dap' = debug adapter)"
+            );
+            std::process::exit(2);
+        }
+        None => {}
+    }
+    run_lsp()
+}
+
+fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let (connection, io_threads) = Connection::stdio();
 
     let capabilities = serde_json::to_value(ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
+            open_close: Some(true),
+            change: Some(TextDocumentSyncKind::FULL),
+            save: Some(TextDocumentSyncSaveOptions::Supported(true)),
+            ..Default::default()
+        })),
         definition_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -841,6 +955,28 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         }
     }
 
+    let options = init.initialization_options.unwrap_or(serde_json::Value::Null);
+    let sdk_override = options.get("sdk").and_then(|v| v.as_str()).map(PathBuf::from);
+    if let Some(path) = &sdk_override {
+        if !renpy_cli::is_sdk_dir(path) {
+            eprintln!(
+                "renpy-language-server: configured sdk '{}' does not look like a Ren'Py SDK \
+                 (no renpy.py inside); ignoring it",
+                path.display()
+            );
+        }
+    }
+    let (lint_tx, lint_rx) = crossbeam_channel::unbounded();
+    let mut lint = LintRunner {
+        enabled: options.get("lint").and_then(|v| v.as_bool()).unwrap_or(true),
+        sdk: sdk_override.filter(|p| renpy_cli::is_sdk_dir(p)).or_else(renpy_cli::find_sdk),
+        project: roots.iter().find_map(|root| renpy_cli::find_project(root)),
+        running: false,
+        pending: false,
+        tx: lint_tx,
+    };
+    let mut lint_diags: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
+
     let builtin_docs = BuiltinDocs::load();
     let mut index = Index::default();
     let mut published: std::collections::HashSet<Url> = Default::default();
@@ -863,8 +999,65 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         builtin_docs.len(),
         RENPY_DOCS_VERSION
     );
+    if !lint.enabled {
+        eprintln!("renpy-language-server: renpy lint disabled by settings");
+    } else {
+        match (&lint.sdk, &lint.project) {
+            (Some(sdk), Some(project)) => eprintln!(
+                "renpy-language-server: renpy lint on save — SDK {} / project {}",
+                sdk.display(),
+                project.display()
+            ),
+            (None, _) => eprintln!(
+                "renpy-language-server: renpy lint inactive — no Ren'Py SDK found \
+                 (set initialization_options.sdk or $RENPY_SDK)"
+            ),
+            (_, None) => eprintln!(
+                "renpy-language-server: renpy lint inactive — workspace has no game/ directory"
+            ),
+        }
+    }
 
-    for msg in &connection.receiver {
+    // `Connection::initialize` has already consumed the client's `initialized`
+    // notification, so post-handshake work starts here, not in the loop.
+    publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
+    lint.request();
+
+    enum Incoming {
+        Client(Message),
+        Lint(Result<String, String>),
+    }
+    loop {
+        let received = crossbeam_channel::select! {
+            recv(connection.receiver) -> msg => match msg {
+                Ok(msg) => Incoming::Client(msg),
+                Err(_) => break,
+            },
+            recv(lint_rx) -> outcome => match outcome {
+                Ok(outcome) => Incoming::Lint(outcome),
+                Err(_) => continue,
+            },
+        };
+        let msg = match received {
+            Incoming::Lint(outcome) => {
+                lint.running = false;
+                match outcome {
+                    Ok(report) => {
+                        if let Some(project) = lint.project.clone() {
+                            lint_diags = lint_diagnostics(&project, &report);
+                            publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
+                        }
+                    }
+                    Err(message) => eprintln!("renpy-language-server: {message}"),
+                }
+                if lint.pending {
+                    lint.pending = false;
+                    lint.request();
+                }
+                continue;
+            }
+            Incoming::Client(msg) => msg,
+        };
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
@@ -1097,15 +1290,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                 }
             }
             Message::Notification(note) => match note.method.as_str() {
-                "initialized" => {
-                    publish_diagnostics(&connection, &index, &mut published)?;
-                }
                 "textDocument/didOpen" => {
                     if let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(note.params) {
                         let uri = params.text_document.uri;
                         index.index_file(&uri, &params.text_document.text);
                         index.open_docs.insert(uri, params.text_document.text);
-                        publish_diagnostics(&connection, &index, &mut published)?;
+                        publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
                     }
                 }
                 "textDocument/didChange" => {
@@ -1115,9 +1305,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                             let uri = params.text_document.uri;
                             index.index_file(&uri, &change.text);
                             index.open_docs.insert(uri, change.text);
-                            publish_diagnostics(&connection, &index, &mut published)?;
+                            publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
                         }
                     }
+                }
+                "textDocument/didSave" => {
+                    lint.request();
                 }
                 "textDocument/didClose" => {
                     if let Ok(params) = serde_json::from_value::<DidCloseTextDocumentParams>(note.params) {
@@ -1128,7 +1321,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                             Some(text) => index.index_file(&uri, &text),
                             None => index.remove_file(&uri),
                         }
-                        publish_diagnostics(&connection, &index, &mut published)?;
+                        publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
                     }
                 }
                 _ => {}

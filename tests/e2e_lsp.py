@@ -79,12 +79,16 @@ script = FIXTURE / "game" / "script.rpy"
 shop = FIXTURE / "game" / "shop.rpy"
 broken = FIXTURE / "game" / "broken.rpy"
 
-# --- handshake, with a workspace folder so the startup scan kicks in
+# --- handshake, with a workspace folder so the startup scan kicks in.
+# Lint is explicitly disabled here: on a machine with a real Ren'Py SDK it
+# would auto-run against the fixture and make diagnostics nondeterministic.
+# The fake-SDK lint flow gets its own deterministic section at the end.
 rid = send("initialize", {
     "processId": None,
     "rootUri": uri(FIXTURE),
     "capabilities": {},
     "workspaceFolders": [{"uri": uri(FIXTURE), "name": "fixture"}],
+    "initializationOptions": {"lint": False},
 })
 init = read_response(rid)
 caps = init.get("result", {}).get("capabilities", {})
@@ -364,6 +368,66 @@ check("server exits cleanly", proc.returncode == 0, detail=str(proc.returncode))
 stderr = proc.stderr.read().decode()
 print("--- server stderr ---")
 print(stderr.strip())
+
+# --- engine lint via the fake SDK: a fresh server instance with lint enabled
+proc = subprocess.Popen(
+    [str(SERVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+)
+# Watchdog: if lint never publishes, reads below would block forever.
+import threading
+watchdog = threading.Timer(60, proc.kill)
+watchdog.daemon = True
+watchdog.start()
+notifications.clear()
+rid = send("initialize", {
+    "processId": None,
+    "rootUri": uri(FIXTURE),
+    "capabilities": {},
+    "workspaceFolders": [{"uri": uri(FIXTURE), "name": "fixture"}],
+    "initializationOptions": {"sdk": str((HERE / "fixture-sdk").resolve())},
+})
+read_response(rid)
+send("initialized", {}, is_request=False)
+
+lint_diags = None
+for _ in range(50):  # lint results arrive asynchronously after `initialized`
+    msg = read_message()
+    if msg.get("method") == "textDocument/publishDiagnostics" and msg["params"]["uri"] == uri(script):
+        found = [d for d in msg["params"]["diagnostics"] if d.get("source") == "renpy lint"]
+        if found:
+            lint_diags = found
+            break
+check(
+    "engine lint published as diagnostics",
+    lint_diags is not None
+    and "fake lint problem from the fake SDK. This second line continues the same problem."
+    in lint_diags[0]["message"],
+    detail=json.dumps(lint_diags),
+)
+check(
+    "lint diagnostic is a warning on the reported line",
+    lint_diags is not None
+    and lint_diags[0]["severity"] == 2
+    and lint_diags[0]["range"]["start"]["line"] == 2,
+    detail=json.dumps(lint_diags),
+)
+
+# a save triggers a re-lint (same fake report; just verify another publish lands)
+send("textDocument/didSave", {"textDocument": {"uri": uri(script)}}, is_request=False)
+relinted = False
+for _ in range(50):
+    msg = read_message()
+    if msg.get("method") == "textDocument/publishDiagnostics" and msg["params"]["uri"] == uri(script):
+        if any(d.get("source") == "renpy lint" for d in msg["params"]["diagnostics"]):
+            relinted = True
+            break
+check("didSave triggers a re-lint", relinted)
+
+rid = send("shutdown", {})
+read_response(rid)
+send("exit", {}, is_request=False)
+proc.wait(timeout=10)
+check("lint server exits cleanly", proc.returncode == 0, detail=str(proc.returncode))
 
 if failures:
     print(f"\n{len(failures)} FAILURE(S)")

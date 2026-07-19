@@ -17,6 +17,8 @@ jobs:
         run: cargo build --release --manifest-path server/Cargo.toml
       - name: End-to-end LSP protocol test
         run: python3 tests/e2e_lsp.py
+      - name: End-to-end DAP protocol test
+        run: python3 tests/e2e_dap.py
       - name: Extension glue compiles for wasm32-wasip2
         run: |
           rustup target add wasm32-wasip2
