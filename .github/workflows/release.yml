@@ -8,7 +8,23 @@ permissions:
   contents: write
 
 jobs:
+  # Create the release once before the matrix fans out — five concurrent
+  # jobs racing to create it hit GitHub's eventual consistency and one can
+  # end up uploading to an orphaned duplicate draft.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure release exists for tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "" || true
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
