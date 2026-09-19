@@ -226,8 +226,22 @@ fn kill_pid(pid: u32, force: bool) {
 }
 
 /// Editor-absolute path -> Ren'Py's project-relative ("elided") form.
+///
+/// The project path comes from the launch config or the adapter's cwd, which
+/// the OS reports with symlinks resolved, while the editor sends the path as
+/// the user opened it (`/tmp/...` vs `/private/tmp/...` on macOS, a
+/// differently cased drive letter on Windows). Try the raw prefix first and
+/// fall back to comparing both sides canonicalized.
 fn elide(project: &Path, absolute: &str) -> Option<String> {
-    let relative = Path::new(absolute).strip_prefix(project).ok()?;
+    let path = Path::new(absolute);
+    let relative = match path.strip_prefix(project) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => {
+            let project = std::fs::canonicalize(project).ok()?;
+            let path = std::fs::canonicalize(path).ok()?;
+            path.strip_prefix(&project).ok()?.to_path_buf()
+        }
+    };
     Some(relative.to_string_lossy().replace('\\', "/"))
 }
 
@@ -253,6 +267,9 @@ struct BridgeState {
     waiting: HashMap<i64, mpsc::Sender<Value>>,
     /// Editor-absolute path -> breakpoint lines, as last set by the client.
     breakpoints: HashMap<String, Vec<u32>>,
+    /// Elided path -> the editor's spelling of it, so stack frames open the
+    /// buffer the user already has rather than a canonicalized twin.
+    editor_paths: HashMap<String, String>,
     project: Option<PathBuf>,
     configuration_done: bool,
     injected_file: Option<PathBuf>,
@@ -315,15 +332,26 @@ impl Bridge {
         Ok(reply)
     }
 
+    /// Remember how the editor spells `absolute` and return its elided form
+    /// (None when the file lies outside the project being debugged).
+    fn map_editor_path(&self, absolute: &str) -> Option<String> {
+        let mut state = self.0.lock().unwrap();
+        let elided = elide(state.project.as_ref()?, absolute)?;
+        state.editor_paths.insert(elided.clone(), absolute.to_string());
+        Some(elided)
+    }
+
     /// Push the client's current breakpoints to the agent, elided.
     fn flush_breakpoints(&self) {
-        let (files, project) = {
+        let files = {
             let state = self.0.lock().unwrap();
-            let Some(project) = state.project.clone() else { return };
-            (state.breakpoints.clone(), project)
+            if state.project.is_none() {
+                return;
+            }
+            state.breakpoints.clone()
         };
         for (absolute, lines) in files {
-            if let Some(elided) = elide(&project, &absolute) {
+            if let Some(elided) = self.map_editor_path(&absolute) {
                 self.agent_send(
                     json!({ "cmd": "set_breakpoints", "file": elided, "lines": lines }),
                     false,
@@ -402,7 +430,11 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
 }
 
 /// Map one agent stack frame to a DAP frame; `frame` doubles as the id.
-fn dap_frame(project: Option<&Path>, frame: &Value) -> Value {
+fn dap_frame(
+    project: Option<&Path>,
+    editor_paths: &HashMap<String, String>,
+    frame: &Value,
+) -> Value {
     let file = frame["file"].as_str().unwrap_or("unknown");
     let mut out = json!({
         "id": frame["frame"],
@@ -411,9 +443,10 @@ fn dap_frame(project: Option<&Path>, frame: &Value) -> Value {
         "column": 1,
     });
     if file != "unknown" {
-        let absolute = match project {
-            Some(project) => project.join(file).to_string_lossy().into_owned(),
-            None => file.to_string(),
+        let absolute = match (editor_paths.get(file), project) {
+            (Some(editor), _) => editor.clone(),
+            (None, Some(project)) => project.join(file).to_string_lossy().into_owned(),
+            (None, None) => file.to_string(),
         };
         out["source"] = json!({
             "name": Path::new(file).file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -625,27 +658,35 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let elided = {
+                let project_known = {
                     let mut state = bridge.0.lock().unwrap();
                     if lines.is_empty() {
                         state.breakpoints.remove(&path);
                     } else {
                         state.breakpoints.insert(path.clone(), lines.clone());
                     }
-                    state
-                        .project
-                        .as_ref()
-                        .and_then(|project| elide(project, &path))
+                    state.project.is_some()
                 };
-                if let Some(elided) = elided {
+                let elided = bridge.map_editor_path(&path);
+                if let Some(elided) = &elided {
                     bridge.agent_send(
                         json!({ "cmd": "set_breakpoints", "file": elided, "lines": lines }),
                         false,
                     );
                 }
+                // Before launch the project is unknown, so trust the client;
+                // afterwards, a file the game cannot map will never hit.
+                let verified = elided.is_some() || !project_known;
                 let breakpoints: Vec<Value> = lines
                     .iter()
-                    .map(|line| json!({ "verified": true, "line": line }))
+                    .map(|line| {
+                        let mut breakpoint = json!({ "verified": verified, "line": line });
+                        if !verified {
+                            breakpoint["message"] =
+                                json!("this file is outside the Ren'Py project being debugged");
+                        }
+                        breakpoint
+                    })
                     .collect();
                 writer.respond(&request, json!({ "breakpoints": breakpoints }));
             }
@@ -665,11 +706,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
             }
             "stackTrace" => match bridge.agent_request(json!({ "cmd": "stack" })) {
                 Ok(reply) => {
-                    let project = bridge.0.lock().unwrap().project.clone();
+                    let (project, editor_paths) = {
+                        let state = bridge.0.lock().unwrap();
+                        (state.project.clone(), state.editor_paths.clone())
+                    };
                     let frames: Vec<Value> = reply["frames"]
                         .as_array()
                         .map(|frames| {
-                            frames.iter().map(|f| dap_frame(project.as_deref(), f)).collect()
+                            frames
+                                .iter()
+                                .map(|f| dap_frame(project.as_deref(), &editor_paths, f))
+                                .collect()
                         })
                         .unwrap_or_default();
                     let total = frames.len();
@@ -875,6 +922,38 @@ mod tests {
         let absolute = if cfg!(windows) { "C:\\proj\\game\\script.rpy" } else { "/proj/game/script.rpy" };
         assert_eq!(elide(project, absolute).as_deref(), Some("game/script.rpy"));
         assert_eq!(elide(project, "/elsewhere/x.rpy"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elide_resolves_symlinked_project_paths() {
+        let base = std::env::temp_dir().join(format!("renpy-dap-elide-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("game")).unwrap();
+        std::fs::write(real.join("game").join("script.rpy"), "").unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // The editor opened the project through the symlink while the
+        // adapter resolved the real directory, and the other way round.
+        let via_link = link.join("game").join("script.rpy");
+        assert_eq!(elide(&real, via_link.to_str().unwrap()).as_deref(), Some("game/script.rpy"));
+        let via_real = real.join("game").join("script.rpy");
+        assert_eq!(elide(&link, via_real.to_str().unwrap()).as_deref(), Some("game/script.rpy"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn frames_reuse_the_editor_spelling_of_a_path() {
+        let project = Path::new("/private/tmp/proj");
+        let mut editor_paths = HashMap::new();
+        editor_paths.insert("game/script.rpy".to_string(), "/tmp/proj/game/script.rpy".to_string());
+        let frame = json!({ "frame": 0, "name": "x", "file": "game/script.rpy", "line": 3 });
+        let out = dap_frame(Some(project), &editor_paths, &frame);
+        assert_eq!(out["source"]["path"], "/tmp/proj/game/script.rpy");
+        let other = json!({ "frame": 1, "name": "y", "file": "game/other.rpy", "line": 1 });
+        let out = dap_frame(Some(project), &editor_paths, &other);
+        let joined = project.join("game/other.rpy");
+        assert_eq!(out["source"]["path"].as_str(), joined.to_str());
     }
 
     #[test]
