@@ -158,8 +158,8 @@ impl RenpyExtension {
     }
 }
 
-/// The DAP request kind a debug configuration asks for. Only launch exists
-/// until the in-game debug agent lands.
+/// The DAP request kind a debug configuration asks for. Only launch is
+/// supported: attaching to an already-running game is not implemented.
 fn request_kind(config: &serde_json::Value) -> Result<StartDebuggingRequestArgumentsRequest> {
     match config.get("request").and_then(|v| v.as_str()) {
         None | Some("launch") => Ok(StartDebuggingRequestArgumentsRequest::Launch),
