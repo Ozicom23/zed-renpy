@@ -369,11 +369,12 @@ impl Bridge {
 }
 
 /// Reads agent messages: replies are routed to waiting DAP requests, stopped
-/// events are forwarded to the client.
-fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_token: String) {
+/// events are forwarded to the client. Returns false if the connection was
+/// not the game (no hello with our token), true once a real session ended.
+fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_token: &str) -> bool {
     let reader = BufReader::new(match stream.try_clone() {
         Ok(clone) => clone,
-        Err(_) => return,
+        Err(_) => return false,
     });
     let mut lines = reader.lines();
 
@@ -382,13 +383,17 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
         Some(Ok(line)) => {
             let hello: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
-                Err(_) => return,
+                Err(_) => return false,
             };
-            if hello["event"] != "hello" || hello["token"].as_str() != Some(&expected_token) {
-                return;
+            if hello["event"] != "hello" || hello["token"].as_str() != Some(expected_token) {
+                eprintln!(
+                    "renpy-language-server: rejected a debug-port connection that did not \
+                     present the session token"
+                );
+                return false;
             }
         }
-        _ => return,
+        _ => return false,
     }
 
     let configuration_done = {
@@ -427,6 +432,7 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
     let mut state = bridge.0.lock().unwrap();
     state.agent = None;
     state.waiting.clear();
+    true
 }
 
 /// Map one agent stack frame to a DAP frame; `frame` doubles as the id.
@@ -527,13 +533,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                                                 Ok((stream, _)) => {
                                                     let _ = stream.set_nodelay(true);
                                                     let _ = stream.set_nonblocking(false);
-                                                    agent_reader(
+                                                    // A connection that is not the game must
+                                                    // not use up the session: keep listening
+                                                    // for the real one until the deadline.
+                                                    if agent_reader(
                                                         stream,
-                                                        bridge,
-                                                        writer_for_agent,
-                                                        token,
-                                                    );
-                                                    break;
+                                                        bridge.clone(),
+                                                        writer_for_agent.clone(),
+                                                        &token,
+                                                    ) {
+                                                        break;
+                                                    }
                                                 }
                                                 Err(err)
                                                     if err.kind()
