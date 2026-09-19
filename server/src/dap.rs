@@ -433,6 +433,14 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
                     "allThreadsStopped": true,
                 }),
             );
+        } else if message["event"] == "error" {
+            writer.output(
+                "console",
+                format!(
+                    "Ren'Py debug agent stood down: {}\n",
+                    message["message"].as_str().unwrap_or("unknown error")
+                ),
+            );
         }
     }
 

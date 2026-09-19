@@ -49,6 +49,10 @@ class Agent(object):
         self.commands_ready = threading.Event()
         self.paused = False
         self.configured = threading.Event()
+        # Set when a hook raised: every hook then stands down for good, so a
+        # bug here (or an engine API change) degrades to "no breakpoints"
+        # instead of surfacing as a game exception on every statement.
+        self.disabled = False
         # Variable reference registry, valid for one pause. ref_targets
         # maps a ref to the object writes should go to (None = read-only
         # view, e.g. a function frame's locals snapshot on Python < 3.13).
@@ -134,6 +138,14 @@ class Agent(object):
 
     def stmt_callback(self, name):
         # Called before every Ren'Py statement, on the main thread.
+        if self.disabled:
+            return
+        try:
+            self._stmt_callback(name)
+        except Exception as e:
+            self.disable("statement hook failed", e)
+
+    def _stmt_callback(self, name):
         self.sync_trace()
         if self.paused:
             return
@@ -164,7 +176,7 @@ class Agent(object):
             self.pause(why, frame=None)
 
     def trace(self, frame, event, arg):
-        if event != "call":
+        if event != "call" or self.disabled:
             return None
         if not (self.py_files or self.step_mode):
             return None
@@ -174,6 +186,17 @@ class Agent(object):
         return self.trace_local
 
     def trace_local(self, frame, event, arg):
+        # An exception escaping a trace function both unhooks the tracer and
+        # propagates into the traced code; contain it instead.
+        if self.disabled:
+            return None
+        try:
+            return self._trace_local(frame, event, arg)
+        except Exception as e:
+            self.disable("python trace hook failed", e)
+            return None
+
+    def _trace_local(self, frame, event, arg):
         if self.paused:
             return self.trace_local
         if event == "line":
@@ -219,6 +242,25 @@ class Agent(object):
                 return True
             f = f.f_back
         return False
+
+    def disable(self, what, exc):
+        self.disabled = True
+        self.paused = False
+        self.pause_requested = False
+        with self.state_lock:
+            self.breakpoints = {}
+            self.py_files = set()
+            self.step_mode = None
+        try:
+            if sys.gettrace() is self.trace_fn:
+                sys.settrace(None)
+        except Exception:
+            pass
+        self.send({
+            "event": "error",
+            "message": "%s (%s: %s); breakpoints are inactive for the rest of this run"
+                       % (what, type(exc).__name__, exc),
+        })
 
     def sync_trace(self):
         # Arm/disarm the (costly) python tracer from the main thread, so the
