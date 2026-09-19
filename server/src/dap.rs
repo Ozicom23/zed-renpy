@@ -212,7 +212,14 @@ fn kill_pid(pid: u32, force: bool) {
     #[cfg(unix)]
     {
         let signal = if force { "-KILL" } else { "-TERM" };
-        let _ = Command::new("kill").arg(signal).arg(pid.to_string()).status();
+        // The game is started as the leader of its own process group (see
+        // launch), so a negative pid reaches everything it spawned, the way
+        // taskkill /T does on Windows. Fall back to the single process if the
+        // group signal is refused for any reason.
+        let group = Command::new("kill").arg(signal).arg("--").arg(format!("-{pid}")).status();
+        if !group.is_ok_and(|status| status.success()) {
+            let _ = Command::new("kill").arg(signal).arg(pid.to_string()).status();
+        }
     }
     #[cfg(windows)]
     {
@@ -591,6 +598,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped());
+                // Own process group, so terminate/disconnect can take down
+                // the launcher and anything it started (see kill_pid).
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
                 let mut child = match command.spawn() {
                     Ok(child) => child,
                     Err(err) => {
