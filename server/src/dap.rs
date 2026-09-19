@@ -116,7 +116,7 @@ fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Value>> {
 
 /// The launch configuration from the editor's debug.json entry. Unknown fields
 /// (label, adapter, editor-internal keys) are ignored.
-#[derive(Default, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct LaunchConfig {
     sdk: Option<String>,
@@ -128,6 +128,29 @@ struct LaunchConfig {
     env: HashMap<String, String>,
     #[serde(rename = "noDebug")]
     no_debug: bool,
+}
+
+/// Deserialize the launch arguments, turning serde's error into a message
+/// that names the offending field. Absent arguments mean "all defaults".
+fn parse_launch_config(arguments: &Value) -> Result<LaunchConfig, String> {
+    if arguments.is_null() {
+        return Ok(LaunchConfig::default());
+    }
+    serde_json::from_value(arguments.clone()).map_err(|err| {
+        // serde's message says what was wrong but not where; every field has
+        // a default, so the one that fails to parse alone is the culprit.
+        let field = arguments.as_object().and_then(|object| {
+            object.iter().find_map(|(key, value)| {
+                serde_json::from_value::<LaunchConfig>(json!({ key.as_str(): value }))
+                    .is_err()
+                    .then(|| key.clone())
+            })
+        });
+        match field {
+            Some(field) => format!("invalid launch configuration: field \"{field}\": {err}"),
+            None => format!("invalid launch configuration: {err}"),
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -425,8 +448,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                 writer.event("initialized", json!({}));
             }
             "launch" => {
-                let config: LaunchConfig =
-                    serde_json::from_value(request["arguments"].clone()).unwrap_or_default();
+                // A malformed field must not silently degrade into the
+                // defaults (which would launch a different project without
+                // the user's sdk/warp settings): report exactly what is wrong.
+                let config = match parse_launch_config(&request["arguments"]) {
+                    Ok(config) => config,
+                    Err(message) => {
+                        writer.fail(&request, message);
+                        continue;
+                    }
+                };
                 let resolved = match resolve_launch(&config) {
                     Ok(resolved) => resolved,
                     Err(message) => {
@@ -807,6 +838,18 @@ mod tests {
         assert!(config.sdk.is_none());
         assert!(config.args.is_empty());
         assert!(!config.no_debug);
+    }
+
+    #[test]
+    fn malformed_launch_config_is_an_error_not_a_default() {
+        let err = parse_launch_config(&json!({ "sdk": "/sdk", "args": "--not-a-list" })).unwrap_err();
+        assert!(err.contains("invalid launch configuration"), "{err}");
+        assert!(err.contains("args"), "{err}");
+        let err = parse_launch_config(&json!({ "env": { "X": 1 } })).unwrap_err();
+        assert!(err.contains("env"), "{err}");
+        assert!(parse_launch_config(&Value::Null).unwrap().sdk.is_none());
+        let ok = parse_launch_config(&json!({ "sdk": "/sdk", "args": ["--a"] })).unwrap();
+        assert_eq!(ok.args, vec!["--a".to_string()]);
     }
 
     #[test]
