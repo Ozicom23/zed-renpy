@@ -154,12 +154,12 @@ impl Index {
             let sites: Vec<&Definition> =
                 defs.iter().filter(|d| d.kind == SymbolKind::FUNCTION).collect();
             if sites.len() > 1 {
-                for site in sites {
+                for site in &sites {
                     out.entry(site.uri.clone()).or_default().push(Diagnostic {
                         range: site.range,
                         severity: Some(DiagnosticSeverity::WARNING),
                         source: Some("renpy".into()),
-                        message: format!("label '{}' is defined {} times", name, defs.len()),
+                        message: format!("label '{}' is defined {} times", name, sites.len()),
                         ..Default::default()
                     });
                 }
@@ -1421,7 +1421,11 @@ mod tests {
         let mut index = Index::default();
         let a = Url::parse("file:///tmp/a.rpy").unwrap();
         let b = Url::parse("file:///tmp/b.rpy").unwrap();
-        index.index_file(&a, "label start:\n    jump shop\n    jump missing\n    jump .local\n");
+        // `default start` shares the name with the two labels; only labels count.
+        index.index_file(
+            &a,
+            "default start = 0\nlabel start:\n    jump shop\n    jump missing\n    jump .local\n",
+        );
         index.index_file(&b, "label shop:\n    return\nlabel start:\n    return\n");
         let diags = index.compute_diagnostics();
         let a_diags = &diags[&a];
