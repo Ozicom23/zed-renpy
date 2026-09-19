@@ -8,6 +8,13 @@ use zed_extension_api::{
 
 const GITHUB_REPO: &str = "Ozicom23/zed-renpy";
 const BINARY_NAME: &str = "renpy-language-server";
+/// The server release this extension version expects. It moves in lockstep
+/// with the version in server/Cargo.toml: CI checks that the two agree and
+/// the release workflow refuses a tag that does not match the crate. Pinning
+/// (rather than "latest") means an extension update can never pair with a
+/// server binary that lacks a mode it relies on, and a cached copy of this
+/// exact version is used without any network round-trip.
+const SERVER_RELEASE_TAG: &str = "v0.2.0";
 
 struct RenpyExtension {
     cached_binary_path: Option<String>,
@@ -33,9 +40,10 @@ fn newest_cached_binary(binary_name: &str) -> Option<String> {
 }
 
 impl RenpyExtension {
-    /// Resolution order: explicit path in Zed settings, then PATH, then a
-    /// binary auto-downloaded from this repo's GitHub releases (cached in the
-    /// extension's work directory, one directory per released version).
+    /// Resolution order: explicit path in Zed settings, then PATH, then the
+    /// pinned release already cached in the extension's work directory, then a
+    /// download of that release from this repo's GitHub releases (one cache
+    /// directory per released version; older ones are pruned).
     ///
     /// `language_server_id` is only used for progress reporting; the debug
     /// adapter resolves the same binary without one.
@@ -76,6 +84,14 @@ impl RenpyExtension {
             zed::Os::Windows => format!("{BINARY_NAME}.exe"),
             _ => BINARY_NAME.to_string(),
         };
+        let version_dir = format!("{BINARY_NAME}-{SERVER_RELEASE_TAG}");
+        let binary_path = format!("{version_dir}/{binary_name}");
+
+        // The pinned version is already on disk: no release lookup needed.
+        if fs::metadata(&binary_path).is_ok_and(|meta| meta.is_file()) {
+            self.cached_binary_path = Some(binary_path.clone());
+            return Ok(zed::Command { command: binary_path, args: Vec::new(), env: Default::default() });
+        }
 
         if let Some(id) = language_server_id {
             zed::set_language_server_installation_status(
@@ -83,10 +99,7 @@ impl RenpyExtension {
                 &zed::LanguageServerInstallationStatus::CheckingForUpdate,
             );
         }
-        let release = match zed::latest_github_release(
-            GITHUB_REPO,
-            zed::GithubReleaseOptions { require_assets: true, pre_release: false },
-        ) {
+        let release = match zed::github_release_by_tag_name(GITHUB_REPO, SERVER_RELEASE_TAG) {
             Ok(release) => release,
             Err(err) => {
                 // Offline or rate-limited: fall back to the newest binary we
@@ -101,7 +114,9 @@ impl RenpyExtension {
                     self.cached_binary_path = Some(path.clone());
                     return Ok(zed::Command { command: path, args: Vec::new(), env: Default::default() });
                 }
-                return Err(format!("failed to check for a renpy-language-server release: {err}"));
+                return Err(format!(
+                    "failed to fetch renpy-language-server release {SERVER_RELEASE_TAG}: {err}"
+                ));
             }
         };
         let target = match (platform, arch) {
@@ -115,34 +130,29 @@ impl RenpyExtension {
             zed::Os::Windows => ("zip", zed::DownloadedFileType::Zip),
             _ => ("tar.gz", zed::DownloadedFileType::GzipTar),
         };
-        let asset_name = format!("{BINARY_NAME}-{}-{target}.{asset_ext}", release.version);
+        let asset_name = format!("{BINARY_NAME}-{SERVER_RELEASE_TAG}-{target}.{asset_ext}");
         let asset = release
             .assets
             .iter()
             .find(|asset| asset.name == asset_name)
             .ok_or_else(|| format!("release {} has no asset {asset_name}", release.version))?;
 
-        let version_dir = format!("{BINARY_NAME}-{}", release.version);
-        let binary_path = format!("{version_dir}/{binary_name}");
+        if let Some(id) = language_server_id {
+            zed::set_language_server_installation_status(
+                id,
+                &zed::LanguageServerInstallationStatus::Downloading,
+            );
+        }
+        zed::download_file(&asset.download_url, &version_dir, file_type)
+            .map_err(|err| format!("failed to download {asset_name}: {err}"))?;
+        zed::make_file_executable(&binary_path)?;
 
-        if !fs::metadata(&binary_path).is_ok_and(|meta| meta.is_file()) {
-            if let Some(id) = language_server_id {
-                zed::set_language_server_installation_status(
-                    id,
-                    &zed::LanguageServerInstallationStatus::Downloading,
-                );
-            }
-            zed::download_file(&asset.download_url, &version_dir, file_type)
-                .map_err(|err| format!("failed to download {asset_name}: {err}"))?;
-            zed::make_file_executable(&binary_path)?;
-
-            // Prune caches of older releases.
-            if let Ok(entries) = fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with(BINARY_NAME) && name != version_dir {
-                        let _ = fs::remove_dir_all(entry.path());
-                    }
+        // Prune caches of other releases.
+        if let Ok(entries) = fs::read_dir(".") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(BINARY_NAME) && name != version_dir {
+                    let _ = fs::remove_dir_all(entry.path());
                 }
             }
         }

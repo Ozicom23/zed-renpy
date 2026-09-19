@@ -18,6 +18,11 @@ jobs:
         with:
           components: clippy
           targets: wasm32-wasip2
+      - name: Server crate version and the extension's release pin agree
+        run: |
+          crate=$(grep -m1 '^version' server/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          pin=$(grep -m1 'const SERVER_RELEASE_TAG' src/lib.rs | sed 's/.*"\(.*\)".*/\1/')
+          test "$pin" = "v$crate" || { echo "src/lib.rs pins $pin but server/Cargo.toml is $crate"; exit 1; }
       - name: Clippy
         run: |
           cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings

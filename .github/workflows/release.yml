@@ -17,6 +17,11 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the server crate version
+        run: |
+          crate=$(grep -m1 '^version' server/Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          test "${{ github.ref_name }}" = "v$crate" || { echo "tag ${{ github.ref_name }} does not match server/Cargo.toml version $crate"; exit 1; }
       - name: Ensure a draft release exists for the tag
         env:
           GH_TOKEN: ${{ github.token }}

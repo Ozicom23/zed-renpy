@@ -24,7 +24,7 @@ Ren'Py visual novel script support for the [Zed](https://zed.dev) editor: syntax
 
 ## Installation
 
-**From the Zed registry** (once published): Extensions (`cmd-shift-x`) → search "Ren'Py" → Install. The language-server binary is downloaded automatically from this repo's GitHub releases on first use; override it any time with `lsp.renpy-language-server.binary.path` in settings, or by putting `renpy-language-server` on PATH.
+**From the Zed registry** (once published): Extensions (`cmd-shift-x`) → search "Ren'Py" → Install. The language-server binary is downloaded automatically from this repo's GitHub releases on first use (the release the extension was built for, pinned in `src/lib.rs`); override it any time with `lsp.renpy-language-server.binary.path` in settings, or by putting `renpy-language-server` on PATH.
 
 **From source (dev):**
 
@@ -45,6 +45,8 @@ cargo build --release --manifest-path server/Cargo.toml
 ```
 
 Hover docs for Ren'Py built-ins come from `server/assets/renpy-docs.json`, generated from **Ren'Py 8.3**'s official documentation and vendored from the MIT-licensed [vscode-language-renpy](https://github.com/LuqueDaniel/vscode-language-renpy) project (license copy: `server/assets/renpy-docs-LICENSE`). The version is a snapshot — to refresh, re-download `src/renpy.json` from that project and bump `RENPY_DOCS_VERSION` in `server/src/main.rs`. The per-symbol links to renpy.org come from `server/assets/renpy-doc-links.json`, generated from the official docs' Sphinx inventory by `server/assets/generate_doc_links.py` (re-run it to refresh).
+
+**Releasing the server:** bump `version` in `server/Cargo.toml` and `SERVER_RELEASE_TAG` in `src/lib.rs` together (CI fails when they disagree), then push a `v<version>` tag. The release workflow builds every platform into a draft release and publishes it only once all assets are uploaded; the workflow refuses a tag that does not match the crate version. Bump `version` in `extension.toml` as well when the extension itself is republished.
 
 Then either put `server/target/release/renpy-language-server` on your PATH, or point Zed at it in settings:
 
