@@ -7,10 +7,21 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-wasip2
+      - name: Clippy
+        run: |
+          cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --release --target wasm32-wasip2 -- -D warnings
       - name: Unit tests
         run: cargo test --manifest-path server/Cargo.toml
       - name: Build server (release)
@@ -22,6 +33,4 @@ jobs:
       - name: End-to-end breakpoint test (skips without a Ren'Py SDK)
         run: python3 tests/e2e_debug_real.py
       - name: Extension glue compiles for wasm32-wasip2
-        run: |
-          rustup target add wasm32-wasip2
-          cargo build --release --target wasm32-wasip2
+        run: cargo build --release --target wasm32-wasip2
