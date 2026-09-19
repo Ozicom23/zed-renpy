@@ -8,20 +8,26 @@ permissions:
   contents: write
 
 jobs:
-  # Create the release once before the matrix fans out — five concurrent
-  # jobs racing to create it hit GitHub's eventual consistency and one can
-  # end up uploading to an orphaned duplicate draft.
+  # One draft release is created up front so the matrix jobs only upload to
+  # it (five jobs racing to create it hit GitHub's eventual consistency and
+  # one can end up on an orphaned duplicate). It is published by the final
+  # job once every asset is in place: the extension resolves "the release
+  # for this tag" and must never see one that is missing its platform's
+  # binary.
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure release exists for tag
+      - name: Ensure a draft release exists for the tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ github.ref_name }}" \
-            --notes "" || true
+          if ! gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "${{ github.ref_name }}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ github.ref_name }}" \
+              --notes "" \
+              --draft
+          fi
 
   build:
     needs: create-release
@@ -61,7 +67,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path "server/target/${{ matrix.target }}/release/renpy-language-server.exe" -DestinationPath "renpy-language-server-${{ github.ref_name }}-${{ matrix.target }}.zip"
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: renpy-language-server-${{ github.ref_name }}-${{ matrix.target }}.*
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            renpy-language-server-${{ github.ref_name }}-${{ matrix.target }}.* \
+            --repo "${{ github.repository }}" --clobber
+
+  # Only reached when every platform built and uploaded.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --draft=false
