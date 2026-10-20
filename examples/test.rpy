@@ -58,3 +58,33 @@ label ending:
     scene expression "black" with fade
     "The end."
     return
+
+# --- Multi-line python values: a statement continues while a bracket or a
+# --- triple-quoted string is open (regression: used to break highlighting
+# --- for the rest of the file)
+define gui.about = _p("""
+About text, with a "quote".
+
+Second paragraph.
+""")
+
+define narrator2 = Character(None,
+    what_italic=True,
+    what_color="#c8c8ff")
+
+default party = [
+    "Ciri",
+    "Geralt",
+]
+
+# --- One line closing several blocks at once (regression: only the first
+# --- DEDENT used to be emitted)
+label double_dedent:
+    menu:
+        "Stay":
+            $ stayed = True
+    return
+
+init python:
+    ## a comment-led python block
+    after_double_dedent = True

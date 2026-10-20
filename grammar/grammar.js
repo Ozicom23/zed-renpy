@@ -5,6 +5,10 @@ module.exports = grammar({
     $._newline,
     $._indent,
     $._dedent,
+    // A Python logical line: runs to end of line, but continues across
+    // newlines inside open brackets and triple-quoted strings, as Python
+    // (and Ren'Py) do. Lexed in src/scanner.c.
+    $.python_content,
   ],
 
   extras: $ => [
@@ -104,8 +108,6 @@ module.exports = grammar({
       )),
       $._dedent,
     ),
-
-    python_content: $ => /[^\n]+/,
 
     //any text followed not by double dot (:) or enter (\n)
     python_expression: $ => /[^:\n]+/,

@@ -7,7 +7,7 @@ The tree-sitter grammar for Ren'Py used by this extension, maintained in-repo.
 ## Layout
 
 - `grammar.js` — the grammar definition (edit this)
-- `src/scanner.c` — external scanner handling INDENT/DEDENT/NEWLINE (edit if block structure changes)
+- `src/scanner.c` — external scanner handling INDENT/DEDENT/NEWLINE (including several DEDENTs for one line) and `python_content`, which spans a Python *logical* line: it continues across newlines inside open brackets and triple-quoted strings
 - `src/parser.c`, `src/grammar.json`, `src/node-types.json` — **generated** by the tree-sitter CLI; must be committed (Zed compiles `src/parser.c` directly and never runs `tree-sitter generate`)
 
 ## Making changes
