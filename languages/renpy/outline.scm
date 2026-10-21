@@ -24,3 +24,28 @@
 
 (python_block
   "python" @context) @item
+
+(screen_statement
+  "screen" @context
+  name: (identifier) @name) @item
+
+(transform_statement
+  "transform" @context
+  name: (dotted_name) @name) @item
+
+(style_statement
+  "style" @context
+  name: (identifier) @name) @item
+
+(layeredimage_statement
+  "layeredimage" @context
+  name: (image_name) @name) @item
+
+(translate_statement
+  "translate" @context
+  language: (identifier) @name
+  id: (identifier)? @name) @item
+
+(testcase_statement
+  "testcase" @context
+  name: (identifier) @name) @item

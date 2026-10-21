@@ -14,5 +14,5 @@ languages = ["Ren'Py"]
 
 [grammars.renpy]
 repository = "https://github.com/Ozicom23/zed-renpy"
-commit = "8e66a399881a98f154c14b6b04538de741d11901"
+commit = "333e6167b4fbd8397ee6a09a0122d929dc5b5c5d"
 path = "grammar"

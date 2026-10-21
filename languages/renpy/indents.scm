@@ -1,4 +1,3 @@
-(_ "(" ")" @end) @indent
 (_ "[" "]" @end) @indent
 
 (label_statement) @start.label
