@@ -11,6 +11,7 @@ enum TokenType {
     INDENT,
     DEDENT,
     PYTHON_CONTENT,
+    BRACKETED,
 };
 
 typedef struct {
@@ -19,6 +20,9 @@ typedef struct {
     // several blocks (`return` after a menu choice), but the measurement only
     // happens at column 0, before the first zero-width DEDENT moves us off it.
     uint8_t pending_dedents;
+    // A file that does not end in a newline still ends its last line: one
+    // zero-width NEWLINE is emitted at EOF, and only one.
+    bool eof_newline_done;
 } Scanner;
 
 static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
@@ -27,6 +31,10 @@ static inline void skip(TSLexer *lexer) { lexer->advance(lexer, true); }
 static inline bool at_line_end(TSLexer *lexer) {
     return lexer->eof(lexer) || lexer->lookahead == '\n' || lexer->lookahead == '\r';
 }
+
+static inline bool is_space(int32_t c) { return c == ' ' || c == '\t' || c == '\f'; }
+
+static inline bool is_closing(int32_t c) { return c == ')' || c == ']' || c == '}'; }
 
 // Consume one Python string literal starting at its opening quote. Triple-
 // quoted strings may span lines; single-quoted ones stop at the line end
@@ -136,6 +144,55 @@ static bool scan_python_content(TSLexer *lexer) {
     return consumed;
 }
 
+// One balanced bracket group starting at its opening bracket: `(0.5, 1.0)`,
+// `[Jump("a"), Return()]`, `("start", x=1)`. Like python_content it spans
+// lines while the brackets are open (with the same column-0 bail-out), so
+// screen-language and ATL arguments may continue across lines.
+static bool scan_bracketed(TSLexer *lexer) {
+    uint32_t depth = 0;
+    while (!lexer->eof(lexer)) {
+        int32_t c = lexer->lookahead;
+        if (c == '\n' || c == '\r') {
+            advance(lexer);
+            if (c == '\r' && lexer->lookahead == '\n') {
+                advance(lexer);
+            }
+            int32_t next = lexer->lookahead;
+            if (!lexer->eof(lexer) && !is_space(next) && next != '\n' && next != '\r' &&
+                !is_closing(next)) {
+                break; // unterminated: ends at the last mark_end
+            }
+            continue;
+        }
+        if (c == '#') {
+            while (!at_line_end(lexer)) {
+                advance(lexer);
+            }
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            scan_python_string(lexer);
+            lexer->mark_end(lexer);
+            continue;
+        }
+        advance(lexer);
+        if (c == '(' || c == '[' || c == '{') {
+            depth++;
+        } else if (is_closing(c)) {
+            lexer->mark_end(lexer);
+            if (depth <= 1) {
+                return true;
+            }
+            depth--;
+            continue;
+        }
+        if (!is_space(c)) {
+            lexer->mark_end(lexer);
+        }
+    }
+    return true;
+}
+
 void *tree_sitter_renpy_external_scanner_create() {
     Scanner *scanner = calloc(1, sizeof(Scanner));
     array_init(&scanner->indents);
@@ -154,8 +211,9 @@ unsigned tree_sitter_renpy_external_scanner_serialize(void *payload, char *buffe
     Scanner *scanner = (Scanner *)payload;
     size_t size = 0;
     buffer[size++] = (char)scanner->pending_dedents;
+    buffer[size++] = (char)scanner->eof_newline_done;
     uint32_t iter = 1;
-    for (; iter < scanner->indents.size && size < TREE_SITTER_SERIALIZATION_BUFFER_SIZE; ++iter) {
+    for (; iter < scanner->indents.size && size + 1 < TREE_SITTER_SERIALIZATION_BUFFER_SIZE; ++iter) {
         uint16_t indent_value = *array_get(&scanner->indents, iter);
         buffer[size++] = (char)(indent_value & 0xFF);
         buffer[size++] = (char)((indent_value >> 8) & 0xFF);
@@ -168,13 +226,46 @@ void tree_sitter_renpy_external_scanner_deserialize(void *payload, const char *b
     array_delete(&scanner->indents);
     array_push(&scanner->indents, 0);
     scanner->pending_dedents = 0;
-    if (length > 0) {
+    scanner->eof_newline_done = false;
+    if (length > 1) {
         scanner->pending_dedents = (uint8_t)buffer[0];
-        for (size_t size = 1; size + 1 < length; size += 2) {
+        scanner->eof_newline_done = buffer[1] != 0;
+        for (size_t size = 2; size + 1 < length; size += 2) {
             uint16_t indent_value = (unsigned char)buffer[size] | ((unsigned char)buffer[size + 1] << 8);
             array_push(&scanner->indents, indent_value);
         }
     }
+}
+
+// At the end of the file: close open blocks, then end the last line once.
+static bool scan_eof(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
+    if (valid_symbols[DEDENT] && scanner->indents.size > 1) {
+        array_pop(&scanner->indents);
+        lexer->result_symbol = DEDENT;
+        return true;
+    }
+    if (valid_symbols[NEWLINE] && !scanner->eof_newline_done) {
+        scanner->eof_newline_done = true;
+        lexer->result_symbol = NEWLINE;
+        return true;
+    }
+    return false;
+}
+
+static bool scan_newline_char(TSLexer *lexer) {
+    if (lexer->lookahead == '\n') {
+        advance(lexer);
+    } else if (lexer->lookahead == '\r') {
+        advance(lexer);
+        if (lexer->lookahead == '\n') {
+            advance(lexer);
+        }
+    } else {
+        return false;
+    }
+    lexer->mark_end(lexer);
+    lexer->result_symbol = NEWLINE;
+    return true;
 }
 
 bool tree_sitter_renpy_external_scanner_scan(
@@ -182,21 +273,17 @@ bool tree_sitter_renpy_external_scanner_scan(
     TSLexer *lexer,
     const bool *valid_symbols
 ) {
-    // 0. Scanner declaration
     Scanner *scanner = (Scanner *)payload;
     // During error recovery every symbol is valid; never let python_content
-    // swallow lines then, or one typo would turn the file into opaque python.
+    // or a bracket group swallow lines then, or one typo would turn the file
+    // into opaque python.
     bool error_recovery = valid_symbols[NEWLINE] && valid_symbols[INDENT] &&
-                          valid_symbols[DEDENT] && valid_symbols[PYTHON_CONTENT];
-    // 1. Handle EOF
-    // If file ended but still had open bloc, force end it with DEDENT
+                          valid_symbols[DEDENT] && valid_symbols[PYTHON_CONTENT] &&
+                          valid_symbols[BRACKETED];
+
+    // 1. End of file
     if (lexer->eof(lexer)) {
-        if (valid_symbols[DEDENT] && scanner->indents.size > 1) {
-            array_pop(&scanner->indents);
-            lexer->result_symbol = DEDENT;
-            return true;
-        }
-        return false;
+        return scan_eof(scanner, lexer, valid_symbols);
     }
 
     // 1b. Further DEDENTs for a line that closes several blocks at once
@@ -210,33 +297,28 @@ bool tree_sitter_renpy_external_scanner_scan(
         scanner->pending_dedents = 0;
     }
 
-    // 2. Handle NEWLINE
-    // If parser ask NEWLINE token and we find \n or \r character
+    bool at_column_0 = lexer->get_column(lexer) == 0;
+    bool indent_valid = valid_symbols[INDENT] || valid_symbols[DEDENT];
+
+    // 2. NEWLINE, after any trailing whitespace. At column 0 the leading
+    // whitespace is left for step 3 to measure.
     if (valid_symbols[NEWLINE]) {
-        if (lexer->lookahead == '\n') {
-            advance(lexer);
-            lexer->mark_end(lexer);
-            lexer->result_symbol = NEWLINE;
-            return true;
-        }
-        if (lexer->lookahead == '\r') {
-            advance(lexer);
-            if (lexer->lookahead == '\n') {
-                advance(lexer);
+        if (!at_column_0 || !indent_valid) {
+            while (is_space(lexer->lookahead)) {
+                skip(lexer);
             }
-            lexer->mark_end(lexer);
-            lexer->result_symbol = NEWLINE;
+            if (lexer->eof(lexer)) {
+                return scan_eof(scanner, lexer, valid_symbols);
+            }
+        }
+        if (scan_newline_char(lexer)) {
             return true;
         }
     }
 
-    // 3. Handle INDENT & DEDENT
-    // Vital Requirement: We only count space if cursor really exist
-    // on the left edge of line (column 0) and parser asks INDENT/DEDENT Token
-    if ((valid_symbols[INDENT] || valid_symbols[DEDENT]) && lexer->get_column(lexer) == 0) {
+    // 3. INDENT / DEDENT, measured at the start of a line
+    if (indent_valid && at_column_0) {
         uint32_t indent_length = 0;
-
-        // skip all space and tabs with counting them
         for (;;) {
             if (lexer->lookahead == ' ') {
                 indent_length++;
@@ -244,18 +326,24 @@ bool tree_sitter_renpy_external_scanner_scan(
             } else if (lexer->lookahead == '\t') {
                 indent_length += 4;
                 skip(lexer);
+            } else if (lexer->lookahead == '\f') {
+                skip(lexer);
             } else {
                 break;
             }
         }
 
-        //ignore empty line or comment line
-        // don't print INDENT/DEDENT for line without any content
-        if (lexer->lookahead == '\n' || lexer->lookahead == '\r' || lexer->lookahead == '#') {
+        if (lexer->eof(lexer)) {
+            return scan_eof(scanner, lexer, valid_symbols);
+        }
+        // Blank lines and comment-only lines never change the indentation
+        if (lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+            return valid_symbols[NEWLINE] && scan_newline_char(lexer);
+        }
+        if (lexer->lookahead == '#') {
             return false;
         }
 
-        // compare current indentation with previous indentation (top of stack)
         uint16_t current_indent = *array_back(&scanner->indents);
 
         if (valid_symbols[INDENT] && indent_length > current_indent) {
@@ -284,6 +372,18 @@ bool tree_sitter_renpy_external_scanner_scan(
     if (valid_symbols[PYTHON_CONTENT] && !error_recovery && scan_python_content(lexer)) {
         lexer->result_symbol = PYTHON_CONTENT;
         return true;
+    }
+
+    // 5. A bracket group in screen-language / ATL arguments
+    if (valid_symbols[BRACKETED] && !error_recovery) {
+        while (is_space(lexer->lookahead)) {
+            skip(lexer);
+        }
+        int32_t c = lexer->lookahead;
+        if ((c == '(' || c == '[' || c == '{') && scan_bracketed(lexer)) {
+            lexer->result_symbol = BRACKETED;
+            return true;
+        }
     }
     return false;
 }

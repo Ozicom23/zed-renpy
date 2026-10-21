@@ -88,3 +88,89 @@ label double_dedent:
 init python:
     ## a comment-led python block
     after_double_dedent = True
+
+# --- Text inside dialogue: interpolation, text tags, escapes
+label text_parts:
+    e "Hello, [player_name]! You have {b}[gold]{/b} gold.{w=0.5} \"Quoted\" [[not interpolated] {{not a tag}"
+    nvl "NVL narration."
+    nvl clear
+    _("Farmers") "A translated speaker name."
+    e "With a translation id." id text_parts_1a2b3c4d
+    window auto hide
+    pause short_pause
+    show eileen happy at left:
+        xalign 0.0
+        linear 1.0 xalign 1.0
+    show screen inventory(["sword"], gold=10) with dissolve
+    call screen confirm(_("Sure?"), yes_action=Return(True))
+    hide screen inventory
+    return
+
+# --- Screen language
+screen inventory(items, gold=0):
+    tag menu
+    modal True
+    default page = 0
+    frame:
+        xalign 0.5 yalign 0.5
+        has vbox spacing 10
+        for i in items:
+            textbutton i action [SetScreenVariable("page", 1),
+                                 Return(i)]
+        text _("Gold: [gold]") size 24 color "#fc0"
+        if gold > 10:
+            add "coin.png" at bounce
+        else:
+            null height 20
+        $ total = len(items)
+        python:
+            page_count = total // 10
+
+# --- ATL and transforms
+transform bounce(height=20):
+    yoffset 0
+    easein 0.3 yoffset -height
+    easeout 0.3 yoffset 0
+    repeat
+
+image eileen wave:
+    "eileen_wave_1.png"
+    pause 0.2
+    "eileen_wave_2.png"
+    pause 0.2
+    repeat
+
+# --- Styles
+style menu_button is button:
+    hover_color "#fff"
+    idle_background Frame("gui/button.png", 10, 10)
+
+style menu_text is default size 22
+
+# --- Layered images
+layeredimage ciri:
+    always:
+        "ciri_base"
+    group outfit:
+        attribute casual default
+        attribute armor
+
+# --- Translations
+translate ukrainian text_parts_1a2b3c4d:
+    e "З ідентифікатором перекладу."
+
+translate ukrainian strings:
+    old "Sure?"
+    new "Певно?"
+
+translate ukrainian python:
+    gui.text_font = "DejaVuSans.ttf"
+
+# --- Other statements
+init offset = -1
+init -1 style default_text size 20
+python early:
+    renpy.register_statement("achieve", parse=lambda l: l.rest())
+label achievements:
+    achieve first_kiss
+    return
