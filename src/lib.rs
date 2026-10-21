@@ -14,7 +14,7 @@ const BINARY_NAME: &str = "renpy-language-server";
 /// (rather than "latest") means an extension update can never pair with a
 /// server binary that lacks a mode it relies on, and a cached copy of this
 /// exact version is used without any network round-trip.
-const SERVER_RELEASE_TAG: &str = "v0.2.0";
+const SERVER_RELEASE_TAG: &str = "v0.3.0";
 
 struct RenpyExtension {
     cached_binary_path: Option<String>,
