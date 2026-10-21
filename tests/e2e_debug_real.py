@@ -372,6 +372,158 @@ response(rid)
 proc.wait(timeout=15)
 check("warp-session adapter exits cleanly", proc.returncode == 0, str(proc.returncode))
 
+# --- scenario 3: conditions, hit counts, logpoints and exceptions, in a
+# fresh copy of the_question with its own startup script
+COND_SCRIPT = """\
+init python:
+    zz_loop_total = 0
+    for zz_i in range(10):
+        zz_loop_total += zz_i
+    zz_log_me = "hello"
+    zz_after_log = 1
+    for zz_j in range(5):
+        zz_hits = zz_j
+    try:
+        zz_caught = 1 / 0
+    except ZeroDivisionError:
+        zz_caught = None
+
+label splashscreen:
+    $ zz_boom = {}["missing"]
+    return
+"""
+project3 = workdir / "proj3"
+shutil.copytree(SDK / "the_question", project3)
+cond_file = project3 / "game" / "zz_cond_test.rpy"
+cond_file.write_text(COND_SCRIPT)
+
+proc = subprocess.Popen(
+    [str(SERVER), "dap"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+)
+killer = threading.Timer(180, proc.kill)
+killer.daemon = True
+killer.start()
+seq[0] = 0
+events.clear()
+
+rid = send("initialize", {"adapterID": "renpy"})
+caps = response(rid).get("body", {})
+check(
+    "adapter advertises conditions, hit counts, logpoints and exception filters",
+    caps.get("supportsConditionalBreakpoints") and caps.get("supportsHitConditionalBreakpoints")
+    and caps.get("supportsLogPoints") and caps.get("supportsExceptionInfoRequest")
+    and [f["filter"] for f in caps.get("exceptionBreakpointFilters", [])] == ["uncaught", "raised"],
+    json.dumps(caps),
+)
+rid = send("setBreakpoints", {
+    "source": {"path": str(cond_file)},
+    "breakpoints": [
+        {"line": 4, "condition": "zz_i == 7"},
+        {"line": 6, "logMessage": "log {zz_log_me} {zz_loop_total} {{braces}}"},
+        {"line": 8, "hitCondition": "3"},
+    ],
+})
+response(rid)
+rid = send("setExceptionBreakpoints", {"filters": ["uncaught", "raised"]})
+resp = response(rid)
+check("exception filters accepted", len(resp["body"]["breakpoints"]) == 2, json.dumps(resp))
+rid = send("configurationDone")
+response(rid)
+rid = send("launch", {"sdk": str(SDK), "project": str(project3)})
+check("scenario 3 launch succeeds", response(rid).get("success") is True)
+
+
+def evaluate(expression):
+    rid = send("evaluate", {"expression": expression, "context": "repl"})
+    resp = response(rid)
+    return resp["body"]["result"] if resp.get("success") else resp.get("message")
+
+
+stop = next_stopped()
+frames = stack() if stop else []
+check(
+    "conditional breakpoint stops only when its condition holds",
+    stop is not None and frames and frames[0]["line"] == 4 and evaluate("zz_i") == "7"
+    and evaluate("zz_loop_total") == "21",
+    json.dumps([stop, frames[:1]]),
+)
+
+rid = send("continue", {"threadId": 1})
+response(rid)
+stop = next_stopped()
+frames = stack() if stop else []
+check(
+    "hit-count breakpoint stops on its 3rd hit",
+    stop is not None and frames and frames[0]["line"] == 8 and evaluate("zz_j") == "2",
+    json.dumps([stop, frames[:1]]),
+)
+logged = [e["body"]["output"] for e in events if e["event"] == "output" and "log " in e["body"]["output"]]
+check(
+    "logpoint printed instead of pausing",
+    logged == ["log hello 45 {braces}\n"],
+    json.dumps(logged),
+)
+
+rid = send("continue", {"threadId": 1})
+response(rid)
+stop = next_stopped()
+frames = stack() if stop else []
+check(
+    "'All raised exceptions' pauses on a caught exception",
+    stop is not None and stop["body"]["reason"] == "exception"
+    and stop["body"].get("text") == "ZeroDivisionError: division by zero"
+    and frames and frames[0]["line"] == 10,
+    json.dumps([stop, frames[:1]]),
+)
+rid = send("exceptionInfo", {"threadId": 1})
+info = response(rid).get("body", {})
+check(
+    "exceptionInfo describes the raised exception",
+    info.get("exceptionId") == "ZeroDivisionError" and info.get("breakMode") == "always"
+    and "1 / 0" in info.get("details", {}).get("stackTrace", ""),
+    json.dumps(info),
+)
+
+# Only script errors from here on: the KeyError in the splashscreen.
+rid = send("setExceptionBreakpoints", {"filters": ["uncaught"]})
+response(rid)
+rid = send("continue", {"threadId": 1})
+response(rid)
+stop = next_stopped()
+frames = stack() if stop else []
+check(
+    "'Script errors' pauses on an uncaught error before the traceback screen",
+    stop is not None and stop["body"]["reason"] == "exception"
+    and "KeyError" in stop["body"].get("text", "")
+    and frames and frames[0]["line"] == 15 and frames[0]["source"]["path"] == str(cond_file),
+    json.dumps([stop, frames[:2]]),
+)
+rid = send("exceptionInfo", {"threadId": 1})
+info = response(rid).get("body", {})
+check(
+    "exceptionInfo marks the script error unhandled",
+    info.get("exceptionId") == "KeyError" and info.get("breakMode") == "unhandled",
+    json.dumps(info),
+)
+check("variables of the failing statement are inspectable", evaluate("zz_loop_total") == "45")
+
+rid = send("continue", {"threadId": 1})
+response(rid)
+time.sleep(2)
+rid = send("terminate", {})
+response(rid)
+while True:
+    msg = read()
+    if msg.get("type") == "event":
+        events.append(msg)
+        if msg["event"] == "terminated":
+            break
+rid = send("disconnect", {})
+response(rid)
+proc.wait(timeout=15)
+check("scenario 3 adapter exits cleanly", proc.returncode == 0, str(proc.returncode))
+
 shutil.rmtree(workdir, ignore_errors=True)
 
 if failures:

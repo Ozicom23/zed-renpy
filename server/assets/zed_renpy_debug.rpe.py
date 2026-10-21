@@ -11,8 +11,14 @@
 #   - a config.statement_callbacks entry pauses on Ren'Py statements
 #     (dialogue, jump, menu, ...) whose file:line has a breakpoint, and
 #     drives statement-level stepping;
-#   - a sys.settrace tracer (armed only while python breakpoints exist or a
-#     step is in flight) pauses inside python: blocks, $ lines and defines.
+#   - a sys.settrace tracer (armed only while python breakpoints exist, a
+#     step is in flight or "all raised exceptions" is on) pauses inside
+#     python: blocks, $ lines and defines;
+#   - a wrapper around renpy.error.report_exception pauses on script errors
+#     before Ren'Py shows its traceback screen, with the failing frames
+#     still inspectable.
+# Breakpoints may carry a condition, a hit condition and a log message
+# (a logpoint prints instead of pausing).
 # While paused, the main thread serves stack/scopes/variables/evaluate
 # requests itself — it owns the frames — until a resume command arrives.
 
@@ -34,10 +40,18 @@ class Agent(object):
         self.wfile = None
         self.send_lock = threading.Lock()
         self.state_lock = threading.Lock()
-        # (elided_file, line) -> True, split by domain checked cheaply.
-        self.breakpoints = {}  # file -> set(lines)
+        # file -> {line: {"condition", "hit", "log", "hits"}}
+        self.breakpoints = {}
         self.py_files = set()  # files that currently carry breakpoints
         self.pause_requested = False
+        # Exception filters chosen in the editor: "uncaught" (script errors
+        # Ren'Py would report) and "raised" (any exception in game python).
+        self.exc_uncaught = False
+        self.exc_raised = False
+        # The exception the current pause is about, for exception_info, and
+        # the last one paused on, so one error never pauses twice.
+        self.exception = None
+        self.last_exception = None
         # Stepping state (bdb-style). mode: None | "step" | "next" | "out"
         # over both domains; frames/depths recorded at the pause we left.
         self.step_mode = None
@@ -97,15 +111,27 @@ class Agent(object):
     def dispatch(self, msg):
         cmd = msg.get("cmd")
         if cmd == "set_breakpoints":
+            specs = {}
+            for bp in msg.get("breakpoints") or [{"line": l} for l in msg.get("lines") or []]:
+                specs[bp.get("line")] = {
+                    "condition": bp.get("condition") or None,
+                    "hit": bp.get("hitCondition") or None,
+                    "log": bp.get("logMessage") or None,
+                    "hits": 0,
+                }
             with self.state_lock:
-                lines = set(msg.get("lines") or [])
                 f = msg.get("file")
-                if lines:
-                    self.breakpoints[f] = lines
+                if specs:
+                    self.breakpoints[f] = specs
                     self.py_files.add(f)
                 else:
                     self.breakpoints.pop(f, None)
                     self.py_files.discard(f)
+            self.reply(msg, {"ok": True})
+        elif cmd == "set_exception_filters":
+            filters = msg.get("filters") or []
+            self.exc_uncaught = "uncaught" in filters
+            self.exc_raised = "raised" in filters
             self.reply(msg, {"ok": True})
         elif cmd == "configuration_done":
             self.configured.set()
@@ -114,10 +140,10 @@ class Agent(object):
             self.pause_requested = True
             self.reply(msg, {"ok": True})
         elif cmd in ("continue", "next", "step_in", "step_out", "stack",
-                     "scopes", "variables", "evaluate", "set_variable"):
+                     "scopes", "variables", "evaluate", "set_variable", "exception_info"):
             if self.paused:
                 self.enqueue(msg)
-            elif cmd in ("stack", "scopes", "variables", "evaluate", "set_variable"):
+            elif cmd in ("stack", "scopes", "variables", "evaluate", "set_variable", "exception_info"):
                 self.reply(msg, {"error": "not stopped"})
             else:
                 self.reply(msg, {"ok": True})
@@ -169,8 +195,8 @@ class Agent(object):
         if why is None and self.breakpoints:
             import renpy
             f, line = renpy.exports.get_filename_line()
-            lines = self.breakpoints.get(normalize(f))
-            if lines and line in lines:
+            specs = self.breakpoints.get(normalize(f))
+            if specs and line in specs and self.should_stop(specs[line], None):
                 why = "breakpoint"
         if why is not None:
             self.pause(why, frame=None)
@@ -178,7 +204,7 @@ class Agent(object):
     def trace(self, frame, event, arg):
         if event != "call" or self.disabled:
             return None
-        if not (self.py_files or self.step_mode):
+        if not (self.py_files or self.step_mode or self.exc_raised):
             return None
         fn = frame.f_code.co_filename
         if not fn.endswith(RPY_SUFFIXES):
@@ -199,6 +225,13 @@ class Agent(object):
     def _trace_local(self, frame, event, arg):
         if self.paused:
             return self.trace_local
+        if event == "exception":
+            # Ren'Py's own scripts (renpy/common) raise and catch exceptions
+            # as a matter of course; only the game's code is of interest.
+            if (self.exc_raised and is_reportable(arg[1]) and arg[1] is not self.last_exception
+                    and not normalize(frame.f_code.co_filename).startswith("renpy/common/")):
+                self.pause("exception", frame=frame, exception=arg[1], mode="always")
+            return self.trace_local
         if event == "line":
             why = None
             if self.pause_requested:
@@ -210,9 +243,11 @@ class Agent(object):
                 why = "step"
             elif self.step_mode == "out" and self.stepping_python and self._in_caller_chain(frame):
                 why = "step"
+            breakpoint_spec = None
             if why is None:
-                lines = self.breakpoints.get(normalize(frame.f_code.co_filename))
-                if lines and frame.f_lineno in lines:
+                specs = self.breakpoints.get(normalize(frame.f_code.co_filename))
+                if specs and frame.f_lineno in specs:
+                    breakpoint_spec = specs[frame.f_lineno]
                     why = "breakpoint"
             # The current statement's own line belongs to the statement
             # callback (which fires around it and stops in the statement
@@ -221,9 +256,111 @@ class Agent(object):
             # stopping on those would pause at a ghost python frame.
             if why is not None and self._is_current_statement_line(frame):
                 why = None
+            # Conditions, hit counts and logpoints are checked last, so a
+            # ghost frame never counts as a hit.
+            if why == "breakpoint" and not self.should_stop(breakpoint_spec, frame):
+                why = None
             if why is not None:
                 self.pause(why, frame=frame)
         return self.trace_local
+
+    # ---- conditions, hit counts, logpoints ------------------------------
+
+    def eval_in(self, expr, frame):
+        if frame is not None:
+            return eval(expr, frame.f_globals, frame.f_locals)
+        import renpy
+        return renpy.python.py_eval(expr)
+
+    def should_stop(self, spec, frame):
+        # Called when execution reaches a breakpoint's line. False means the
+        # breakpoint does not fire this time (condition false, hit count not
+        # reached, or a logpoint, which only prints).
+        if spec["condition"]:
+            try:
+                if not self.eval_in(spec["condition"], frame):
+                    return False
+            except Exception as e:
+                self.output("Breakpoint condition %r failed (%s: %s); pausing.\n"
+                            % (spec["condition"], type(e).__name__, e))
+                return True
+        spec["hits"] += 1
+        if spec["hit"] and not hit_condition_met(spec["hit"], spec["hits"]):
+            return False
+        if spec["log"]:
+            self.output(self.interpolate(spec["log"], frame) + "\n")
+            return False
+        return True
+
+    def interpolate(self, message, frame):
+        # Logpoint text: {expression} is replaced by its value, {{ and }}
+        # are literal braces.
+        out = []
+        i = 0
+        while i < len(message):
+            c = message[i]
+            if c == "{" and message.startswith("{{", i):
+                out.append("{")
+                i += 2
+            elif c == "}" and message.startswith("}}", i):
+                out.append("}")
+                i += 2
+            elif c == "{":
+                end = message.find("}", i)
+                if end < 0:
+                    out.append(message[i:])
+                    break
+                expr = message[i + 1:end]
+                try:
+                    value = self.eval_in(expr, frame)
+                    out.append(value if isinstance(value, str) else safe_repr(value))
+                except Exception as e:
+                    out.append("<%s: %s>" % (type(e).__name__, e))
+                i = end + 1
+            else:
+                out.append(c)
+                i += 1
+        return "".join(out)
+
+    def output(self, text):
+        self.send({"event": "output", "text": text})
+
+    # ---- exceptions ----------------------------------------------------
+
+    def report_hook(self, original):
+        # Wraps renpy.error.report_exception: Ren'Py calls it for every
+        # script error (at init and in game) before it shows the traceback
+        # screen. The traceback still holds the failing frames.
+        agent = self
+
+        def report_exception(e, *args, **kwargs):
+            try:
+                if (agent.exc_uncaught and not agent.disabled and not agent.paused
+                        and isinstance(e, BaseException) and e is not agent.last_exception):
+                    agent.pause("exception", frame=deepest_script_frame(e),
+                                exception=e, mode="unhandled")
+            except Exception as hook_error:
+                agent.disable("exception hook failed", hook_error)
+            return original(e, *args, **kwargs)
+
+        report_exception._zed_original = original
+        return report_exception
+
+    def exception_info(self):
+        e = self.exception
+        if e is None:
+            return {"error": "not stopped on an exception"}
+        import traceback
+        try:
+            trace = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        except Exception:
+            trace = ""
+        return {
+            "type": type(e).__name__,
+            "message": str(e),
+            "mode": getattr(self, "_exception_mode", "unhandled"),
+            "traceback": trace,
+        }
 
     def _is_current_statement_line(self, frame):
         try:
@@ -265,7 +402,7 @@ class Agent(object):
     def sync_trace(self):
         # Arm/disarm the (costly) python tracer from the main thread, so the
         # game pays nothing while no python breakpoints or steps are active.
-        want = bool(self.py_files) or self.step_mode is not None
+        want = bool(self.py_files) or self.step_mode is not None or self.exc_raised
         if want and sys.gettrace() is not self.trace_fn:
             sys.settrace(self.trace_fn)
         elif not want and sys.gettrace() is self.trace_fn:
@@ -273,21 +410,29 @@ class Agent(object):
 
     # ---- pausing -------------------------------------------------------
 
-    def pause(self, reason, frame):
+    def pause(self, reason, frame, exception=None, mode=None):
         self.paused = True
         self.pause_requested = False
         self.step_mode = None
         self.refs = {}
         self.ref_targets = {}
         self.next_ref = 1
+        self.exception = exception
+        self._exception_mode = mode
+        if exception is not None:
+            self.last_exception = exception
         stack = self.build_stack(frame)
         top = stack[0] if stack else {"file": "unknown", "line": 0}
-        self.send({
+        stopped = {
             "event": "stopped",
             "reason": reason,
             "file": top.get("file"),
             "line": top.get("line"),
-        })
+        }
+        if exception is not None:
+            stopped["description"] = "Paused on %s" % type(exception).__name__
+            stopped["text"] = "%s: %s" % (type(exception).__name__, exception)
+        self.send(stopped)
         self._stack = stack
         self._frame = frame
         while True:
@@ -310,13 +455,18 @@ class Agent(object):
                     self.reply(msg, self.set_variable(
                         msg.get("ref") or 0, msg.get("name") or "",
                         msg.get("value") or "None"))
+                elif cmd == "exception_info":
+                    self.reply(msg, self.exception_info())
                 elif cmd in ("continue", "next", "step_in", "step_out"):
                     self.reply(msg, {"ok": True})
                     resume = cmd
                     break
             if resume is not None:
                 break
-        self.apply_resume(resume, frame)
+        # After an exception there is nothing to step into: Ren'Py unwinds
+        # to its error handling, so any resume continues.
+        self.apply_resume("continue" if exception is not None else resume, frame)
+        self.exception = None
         self._stack = None
         self._frame = None
         self.paused = False
@@ -531,6 +681,49 @@ def normalize(filename):
     return filename.replace("\\", "/")
 
 
+def hit_condition_met(condition, hits):
+    # DAP hit conditions as editors write them: "5" or "==5" (exactly the
+    # 5th hit), ">5", ">=5", "<5", "<=5", "%5" (every 5th hit).
+    text = condition.replace(" ", "")
+    for op, test in ((">=", lambda n: hits >= n), ("<=", lambda n: hits <= n),
+                     ("==", lambda n: hits == n), (">", lambda n: hits > n),
+                     ("<", lambda n: hits < n), ("%", lambda n: n > 0 and hits % n == 0)):
+        if text.startswith(op):
+            try:
+                return test(int(text[len(op):]))
+            except ValueError:
+                return True
+    try:
+        return hits == int(text)
+    except ValueError:
+        return True
+
+
+# Exceptions Ren'Py uses for control flow (jump, call, restart, quit, ...)
+# and Python's iteration protocol: never errors.
+CONTROL_FLOW = ("StopIteration", "StopAsyncIteration", "GeneratorExit")
+
+
+def is_reportable(e):
+    if e is None or type(e).__name__ in CONTROL_FLOW:
+        return False
+    module = type(e).__module__ or ""
+    return not (module == "renpy" or module.startswith("renpy."))
+
+
+def deepest_script_frame(e):
+    # The innermost frame of the exception's traceback that runs game script
+    # code, or None when the error was raised by the engine itself (the
+    # pause then shows the failing statement).
+    frame = None
+    tb = getattr(e, "__traceback__", None)
+    while tb is not None:
+        if tb.tb_frame.f_code.co_filename.endswith(RPY_SUFFIXES):
+            frame = tb.tb_frame
+        tb = tb.tb_next
+    return frame
+
+
 def label_name(node):
     name = getattr(node, "name", None)
     if isinstance(name, str):
@@ -575,7 +768,9 @@ def start():
     agent.configured.wait(5)
 
     import renpy.config
+    import renpy.error
     renpy.config.statement_callbacks.append(agent.stmt_callback)
+    renpy.error.report_exception = agent.report_hook(renpy.error.report_exception)
     agent.sync_trace()
 
 

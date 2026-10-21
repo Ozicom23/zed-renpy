@@ -283,8 +283,11 @@ struct BridgeState {
     agent: Option<TcpStream>,
     next_id: i64,
     waiting: HashMap<i64, mpsc::Sender<Value>>,
-    /// Editor-absolute path -> breakpoint lines, as last set by the client.
-    breakpoints: HashMap<String, Vec<u32>>,
+    /// Editor-absolute path -> breakpoints as last set by the client, each
+    /// `{line, condition?, hitCondition?, logMessage?}`.
+    breakpoints: HashMap<String, Vec<Value>>,
+    /// Exception filters the client enabled ("uncaught", "raised").
+    exception_filters: Vec<String>,
     /// Elided path -> the editor's spelling of it, so stack frames open the
     /// buffer the user already has rather than a canonicalized twin.
     editor_paths: HashMap<String, String>,
@@ -359,23 +362,25 @@ impl Bridge {
         Some(elided)
     }
 
-    /// Push the client's current breakpoints to the agent, elided.
+    /// Push the client's current breakpoints and exception filters to the
+    /// agent, breakpoint paths elided.
     fn flush_breakpoints(&self) {
-        let files = {
+        let (files, filters) = {
             let state = self.0.lock().unwrap();
             if state.project.is_none() {
                 return;
             }
-            state.breakpoints.clone()
+            (state.breakpoints.clone(), state.exception_filters.clone())
         };
-        for (absolute, lines) in files {
+        for (absolute, breakpoints) in files {
             if let Some(elided) = self.map_editor_path(&absolute) {
                 self.agent_send(
-                    json!({ "cmd": "set_breakpoints", "file": elided, "lines": lines }),
+                    json!({ "cmd": "set_breakpoints", "file": elided, "breakpoints": breakpoints }),
                     false,
                 );
             }
         }
+        self.agent_send(json!({ "cmd": "set_exception_filters", "filters": filters }), false);
     }
 
     fn remove_injected_file(&self) {
@@ -436,14 +441,19 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
             continue;
         }
         if message["event"] == "stopped" {
-            writer.event(
-                "stopped",
-                json!({
-                    "reason": message["reason"],
-                    "threadId": 1,
-                    "allThreadsStopped": true,
-                }),
-            );
+            let mut body = json!({
+                "reason": message["reason"],
+                "threadId": 1,
+                "allThreadsStopped": true,
+            });
+            for key in ["description", "text"] {
+                if message.get(key).is_some() {
+                    body[key] = message[key].clone();
+                }
+            }
+            writer.event("stopped", body);
+        } else if message["event"] == "output" {
+            writer.output("console", message["text"].as_str().unwrap_or("").to_string());
         } else if message["event"] == "error" {
             writer.output(
                 "console",
@@ -459,6 +469,28 @@ fn agent_reader(stream: TcpStream, bridge: Bridge, writer: Writer, expected_toke
     state.agent = None;
     state.waiting.clear();
     true
+}
+
+/// The client's breakpoints for one file, reduced to what the agent uses:
+/// `{line, condition?, hitCondition?, logMessage?}`.
+fn breakpoint_specs(breakpoints: &Value) -> Vec<Value> {
+    breakpoints
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter_map(|bp| {
+                    let line = bp["line"].as_u64()?;
+                    let mut spec = json!({ "line": line });
+                    for key in ["condition", "hitCondition", "logMessage"] {
+                        if let Some(text) = bp[key].as_str().filter(|t| !t.trim().is_empty()) {
+                            spec[key] = json!(text);
+                        }
+                    }
+                    Some(spec)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Map one agent stack frame to a DAP frame; `frame` doubles as the id.
@@ -508,6 +540,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                         "supportsConfigurationDoneRequest": true,
                         "supportsTerminateRequest": true,
                         "supportsSetVariable": true,
+                        "supportsConditionalBreakpoints": true,
+                        "supportsHitConditionalBreakpoints": true,
+                        "supportsLogPoints": true,
+                        "supportsExceptionInfoRequest": true,
+                        "exceptionBreakpointFilters": [
+                            {
+                                "filter": "uncaught",
+                                "label": "Script errors",
+                                "description": "Pause where an error is raised that Ren'Py would \
+                                                report on its traceback screen",
+                                "default": true,
+                            },
+                            {
+                                "filter": "raised",
+                                "label": "All raised exceptions",
+                                "description": "Pause on every exception raised in the game's \
+                                                Python code, even ones it catches",
+                                "default": false,
+                            },
+                        ],
                     }),
                 );
                 writer.event("initialized", json!({}));
@@ -693,27 +745,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let lines: Vec<u32> = request["arguments"]["breakpoints"]
-                    .as_array()
-                    .map(|list| {
-                        list.iter()
-                            .filter_map(|bp| bp["line"].as_u64().map(|l| l as u32))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let requested = breakpoint_specs(&request["arguments"]["breakpoints"]);
+                let lines: Vec<u64> = requested.iter().filter_map(|bp| bp["line"].as_u64()).collect();
                 let project_known = {
                     let mut state = bridge.0.lock().unwrap();
-                    if lines.is_empty() {
+                    if requested.is_empty() {
                         state.breakpoints.remove(&path);
                     } else {
-                        state.breakpoints.insert(path.clone(), lines.clone());
+                        state.breakpoints.insert(path.clone(), requested.clone());
                     }
                     state.project.is_some()
                 };
                 let elided = bridge.map_editor_path(&path);
                 if let Some(elided) = &elided {
                     bridge.agent_send(
-                        json!({ "cmd": "set_breakpoints", "file": elided, "lines": lines }),
+                        json!({ "cmd": "set_breakpoints", "file": elided, "breakpoints": requested }),
                         false,
                     );
                 }
@@ -737,8 +783,31 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                 writer.respond(&request, json!({ "breakpoints": [] }));
             }
             "setExceptionBreakpoints" => {
-                writer.respond(&request, json!({ "breakpoints": [] }));
+                let filters: Vec<String> = request["arguments"]["filters"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(|f| f.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                bridge.0.lock().unwrap().exception_filters = filters.clone();
+                bridge.agent_send(json!({ "cmd": "set_exception_filters", "filters": filters }), false);
+                let verified: Vec<Value> = filters.iter().map(|_| json!({ "verified": true })).collect();
+                writer.respond(&request, json!({ "breakpoints": verified }));
             }
+            "exceptionInfo" => match bridge.agent_request(json!({ "cmd": "exception_info" })) {
+                Ok(reply) => writer.respond(
+                    &request,
+                    json!({
+                        "exceptionId": reply["type"],
+                        "description": reply["message"],
+                        "breakMode": reply["mode"],
+                        "details": {
+                            "message": reply["message"],
+                            "typeName": reply["type"],
+                            "stackTrace": reply["traceback"],
+                        },
+                    }),
+                ),
+                Err(message) => writer.fail(&request, message),
+            },
             "configurationDone" => {
                 bridge.0.lock().unwrap().configuration_done = true;
                 bridge.agent_send(json!({ "cmd": "configuration_done" }), false);
@@ -884,6 +953,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
             "terminate" => {
                 if let Some(pid) = *game_pid.lock().unwrap() {
                     kill_pid(pid, false);
+                    // SDL turns SIGTERM into a window-close event, which an
+                    // in-game Ren'Py answers with "Are you sure you want to
+                    // quit?" instead of exiting. A game still running after
+                    // a grace period is killed outright.
+                    let game_pid = game_pid.clone();
+                    std::thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while Instant::now() < deadline {
+                            if *game_pid.lock().unwrap() != Some(pid) {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        if *game_pid.lock().unwrap() == Some(pid) {
+                            kill_pid(pid, true);
+                        }
+                    });
                 }
                 writer.respond(&request, json!({}));
             }
