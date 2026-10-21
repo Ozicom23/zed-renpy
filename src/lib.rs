@@ -3,7 +3,7 @@ use std::fs;
 use zed_extension_api::{
     self as zed, serde_json, settings::LspSettings, DebugAdapterBinary, DebugConfig, DebugRequest,
     DebugScenario, DebugTaskDefinition, LanguageServerId, Result, StartDebuggingRequestArguments,
-    StartDebuggingRequestArgumentsRequest,
+    StartDebuggingRequestArgumentsRequest, TaskTemplate,
 };
 
 const GITHUB_REPO: &str = "Ozicom23/zed-renpy";
@@ -180,6 +180,18 @@ fn request_kind(config: &serde_json::Value) -> Result<StartDebuggingRequestArgum
     }
 }
 
+/// The debug configuration for one of the tasks in languages/renpy/tasks.json,
+/// which mark themselves with `RENPY_ZED_TASK` (`run`, `warp` or `lint`).
+/// `$ZED_FILE`/`$ZED_ROW` are filled in by Zed when the session starts.
+fn task_debug_config(task: &TaskTemplate) -> Option<serde_json::Value> {
+    let kind = task.env.iter().find(|(key, _)| key == "RENPY_ZED_TASK")?.1.as_str();
+    match kind {
+        "run" => Some(serde_json::json!({ "request": "launch" })),
+        "warp" => Some(serde_json::json!({ "request": "launch", "warp": "$ZED_FILE:$ZED_ROW" })),
+        _ => None,
+    }
+}
+
 impl zed::Extension for RenpyExtension {
     fn new() -> Self {
         RenpyExtension { cached_binary_path: None }
@@ -264,6 +276,29 @@ impl zed::Extension for RenpyExtension {
                 Err("attaching to a running Ren'Py game is not supported yet".to_string())
             }
         }
+    }
+
+    /// Offers "debug" next to "run" for the Ren'Py tasks: the ▶ beside a
+    /// label, "run from line" and "run game" all get a debugger variant
+    /// that starts the same game under the debug adapter.
+    fn dap_locator_create_scenario(
+        &mut self,
+        locator_name: String,
+        build_task: TaskTemplate,
+        resolved_label: String,
+        _debug_adapter_name: String,
+    ) -> Option<DebugScenario> {
+        if locator_name != "renpy" {
+            return None;
+        }
+        let config = task_debug_config(&build_task)?;
+        Some(DebugScenario {
+            label: resolved_label.replacen("Ren'Py: run", "Ren'Py: debug", 1),
+            adapter: "renpy".to_string(),
+            build: None,
+            config: config.to_string(),
+            tcp_connection: None,
+        })
     }
 }
 

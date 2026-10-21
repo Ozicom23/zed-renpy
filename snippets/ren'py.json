@@ -1,0 +1,225 @@
+{
+  "Label": {
+    "prefix": "label",
+    "body": [
+      "label ${1:name}:",
+      "    $0"
+    ],
+    "description": "A label: a named place in the script"
+  },
+  "Menu": {
+    "prefix": "menu",
+    "body": [
+      "menu:",
+      "    \"${1:First choice}\":",
+      "        $2",
+      "    \"${3:Second choice}\":",
+      "        $0"
+    ],
+    "description": "A menu with two choices"
+  },
+  "Menu with caption": {
+    "prefix": "menuc",
+    "body": [
+      "menu:",
+      "    ${1:e} \"${2:What should I do?}\"",
+      "    \"${3:First choice}\":",
+      "        $4",
+      "    \"${5:Second choice}\":",
+      "        $0"
+    ],
+    "description": "A menu whose question stays on screen"
+  },
+  "Conditional choice": {
+    "prefix": "choiceif",
+    "body": [
+      "\"${1:Choice}\" if ${2:condition}:",
+      "    $0"
+    ],
+    "description": "A menu choice shown only when a condition holds"
+  },
+  "If / else": {
+    "prefix": "ifelse",
+    "body": [
+      "if ${1:condition}:",
+      "    $2",
+      "else:",
+      "    $0"
+    ],
+    "description": "If with an else branch"
+  },
+  "If / elif / else": {
+    "prefix": "ifelif",
+    "body": [
+      "if ${1:condition}:",
+      "    $2",
+      "elif ${3:condition}:",
+      "    $4",
+      "else:",
+      "    $0"
+    ],
+    "description": "If with elif and else branches"
+  },
+  "Character": {
+    "prefix": "character",
+    "body": [
+      "define ${1:e} = Character(\"${2:Eileen}\", color=\"${3:#c8ffc8}\")"
+    ],
+    "description": "Define a speaking character"
+  },
+  "Character with image": {
+    "prefix": "characterimg",
+    "body": [
+      "define ${1:e} = Character(\"${2:Eileen}\", image=\"${3:eileen}\", color=\"${4:#c8ffc8}\")"
+    ],
+    "description": "A character whose say lines can change the image's attributes"
+  },
+  "Default variable": {
+    "prefix": "default",
+    "body": [
+      "default ${1:name} = ${0:value}"
+    ],
+    "description": "A variable that is saved and rolled back"
+  },
+  "Show at with": {
+    "prefix": "showat",
+    "body": [
+      "show ${1:eileen happy} at ${2:left} with ${0:dissolve}"
+    ],
+    "description": "Show an image at a position with a transition"
+  },
+  "Scene with": {
+    "prefix": "scenewith",
+    "body": [
+      "scene ${1:bg room} with ${0:fade}"
+    ],
+    "description": "Clear the screen and show a background"
+  },
+  "Image": {
+    "prefix": "image",
+    "body": [
+      "image ${1:name} = \"${0:file.png}\""
+    ],
+    "description": "Define an image"
+  },
+  "ATL image": {
+    "prefix": "imageatl",
+    "body": [
+      "image ${1:name}:",
+      "    \"${2:frame1.png}\"",
+      "    pause ${3:0.5}",
+      "    \"${4:frame2.png}\"",
+      "    pause ${3:0.5}",
+      "    repeat"
+    ],
+    "description": "An animated image"
+  },
+  "Transform": {
+    "prefix": "transform",
+    "body": [
+      "transform ${1:name}:",
+      "    ${2:xalign 0.5}",
+      "    ${3:linear} ${4:1.0} ${0:alpha 1.0}"
+    ],
+    "description": "A transform (ATL)"
+  },
+  "Screen": {
+    "prefix": "screen",
+    "body": [
+      "screen ${1:name}():",
+      "    ${2:modal True}",
+      "    frame:",
+      "        xalign 0.5",
+      "        yalign 0.5",
+      "        vbox:",
+      "            $0"
+    ],
+    "description": "A screen with a centered frame"
+  },
+  "Text button": {
+    "prefix": "textbutton",
+    "body": [
+      "textbutton _(\"${1:Label}\") action ${0:Return()}"
+    ],
+    "description": "A text button"
+  },
+  "Image button": {
+    "prefix": "imagebutton",
+    "body": [
+      "imagebutton auto \"${1:gui/button_%s.png}\" action ${0:Return()}"
+    ],
+    "description": "An image button with idle/hover images"
+  },
+  "Vbox": {
+    "prefix": "vbox",
+    "body": [
+      "vbox:",
+      "    spacing ${1:10}",
+      "    $0"
+    ],
+    "description": "A vertical box"
+  },
+  "Hbox": {
+    "prefix": "hbox",
+    "body": [
+      "hbox:",
+      "    spacing ${1:10}",
+      "    $0"
+    ],
+    "description": "A horizontal box"
+  },
+  "Style": {
+    "prefix": "style",
+    "body": [
+      "style ${1:name} is ${2:default}:",
+      "    $0"
+    ],
+    "description": "A style that inherits from another"
+  },
+  "Layered image": {
+    "prefix": "layeredimage",
+    "body": [
+      "layeredimage ${1:eileen}:",
+      "    always:",
+      "        \"${2:eileen_base}\"",
+      "    group ${3:outfit}:",
+      "        attribute ${4:casual} default",
+      "    group ${5:face}:",
+      "        attribute ${6:happy} default",
+      "        attribute ${0:sad}"
+    ],
+    "description": "A layered image with outfit and face groups"
+  },
+  "Init python": {
+    "prefix": "initpython",
+    "body": [
+      "init python:",
+      "    $0"
+    ],
+    "description": "Python that runs when the game starts"
+  },
+  "Play music": {
+    "prefix": "playmusic",
+    "body": [
+      "play music \"${1:audio/theme.ogg}\" fadein ${0:1.0}"
+    ],
+    "description": "Play music with a fade-in"
+  },
+  "Call with return": {
+    "prefix": "callfrom",
+    "body": [
+      "call ${1:label} from _call_${1:label}"
+    ],
+    "description": "Call a label with a from clause, so saves survive script edits"
+  },
+  "Translation strings": {
+    "prefix": "translatestrings",
+    "body": [
+      "translate ${1:language} strings:",
+      "",
+      "    old \"${2:Original}\"",
+      "    new \"${0:Translation}\""
+    ],
+    "description": "Translated interface strings"
+  }
+}

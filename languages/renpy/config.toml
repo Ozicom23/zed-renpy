@@ -1,5 +1,6 @@
 name = "Ren'Py"
 grammar = "renpy"
+debuggers = ["renpy"]
 path_suffixes = ["rpy", "rpym"]
 line_comments = ["# "]
 autoclose_before = ";:.,=}])>"

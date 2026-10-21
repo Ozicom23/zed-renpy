@@ -184,9 +184,20 @@ fn resolve_launch(config: &LaunchConfig) -> Result<ResolvedLaunch, String> {
     let invocation = renpy_cli::sdk_invocation(&sdk)
         .ok_or_else(|| format!("Ren'Py SDK at '{}' has no launcher for this platform", sdk.display()))?;
 
-    let start = match &config.project {
-        Some(path) => PathBuf::from(path),
-        None => std::env::current_dir().map_err(|err| err.to_string())?,
+    // Without an explicit project, the file being warped to knows which
+    // project it belongs to (a worktree may hold several); else the cwd,
+    // which is the worktree root.
+    let warp_dir = config
+        .warp
+        .as_deref()
+        .and_then(|warp| warp.rsplit_once(':'))
+        .map(|(path, _)| PathBuf::from(path))
+        .filter(|path| path.is_absolute())
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let start = match (&config.project, warp_dir) {
+        (Some(path), _) => PathBuf::from(path),
+        (None, Some(dir)) => dir,
+        (None, None) => std::env::current_dir().map_err(|err| err.to_string())?,
     };
     let project = renpy_cli::find_project(&start).ok_or_else(|| {
         format!(
@@ -946,6 +957,25 @@ mod tests {
         };
         let err = resolve_launch(&config).unwrap_err();
         assert!(err.contains("does not look like a Ren'Py SDK"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_comes_from_the_warp_file_when_not_configured() {
+        let base = std::env::temp_dir().join(format!("renpy-dap-warp-{}", std::process::id()));
+        let game = base.join("worktree/second/game");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(base.join("worktree/first/game")).unwrap();
+        let sdk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixture-sdk");
+        let config = LaunchConfig {
+            sdk: Some(sdk.to_string_lossy().into_owned()),
+            warp: Some(format!("{}:12", game.join("script.rpy").display())),
+            ..Default::default()
+        };
+        let resolved = resolve_launch(&config).unwrap();
+        assert_eq!(resolved.project, base.join("worktree/second"));
+        assert!(resolved.args.ends_with(&["--warp".to_string(), "game/script.rpy:12".to_string()]));
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

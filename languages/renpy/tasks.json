@@ -1,0 +1,61 @@
+[
+  {
+    "label": "Ren'Py: run game",
+    "command": "sh",
+    "args": [
+      "-c",
+      "f=\"$ZED_FILE\"; p=$(printf '%s' \"$f\" | sed 's|\\(.*\\)/game/.*|\\1|'); rel=\"game/$(printf '%s' \"$f\" | sed 's|.*/game/||')\"; if [ \"$p\" = \"$f\" ]; then echo \"$f is not inside a game/ folder\" >&2; exit 1; fi; s=\"$RENPY_SDK\"; if [ -z \"$s\" ]; then s=$(find \"$HOME\" \"$HOME/Documents\" \"$HOME/Downloads\" \"$HOME/Desktop\" -maxdepth 1 -type d -name 'renpy-*-sdk' 2>/dev/null | awk -F/ '{print $NF \"\\t\" $0}' | sort -V | tail -n 1 | cut -f 2); fi; if [ ! -f \"$s/renpy.sh\" ]; then echo 'No Ren-Py SDK found: set RENPY_SDK to the SDK folder' >&2; exit 1; fi; exec \"$s/renpy.sh\" \"$p\" run"
+    ],
+    "env": {
+      "RENPY_ZED_TASK": "run"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Ren'Py: run from line $ZED_ROW",
+    "command": "sh",
+    "args": [
+      "-c",
+      "f=\"$ZED_FILE\"; p=$(printf '%s' \"$f\" | sed 's|\\(.*\\)/game/.*|\\1|'); rel=\"game/$(printf '%s' \"$f\" | sed 's|.*/game/||')\"; if [ \"$p\" = \"$f\" ]; then echo \"$f is not inside a game/ folder\" >&2; exit 1; fi; s=\"$RENPY_SDK\"; if [ -z \"$s\" ]; then s=$(find \"$HOME\" \"$HOME/Documents\" \"$HOME/Downloads\" \"$HOME/Desktop\" -maxdepth 1 -type d -name 'renpy-*-sdk' 2>/dev/null | awk -F/ '{print $NF \"\\t\" $0}' | sort -V | tail -n 1 | cut -f 2); fi; if [ ! -f \"$s/renpy.sh\" ]; then echo 'No Ren-Py SDK found: set RENPY_SDK to the SDK folder' >&2; exit 1; fi; exec \"$s/renpy.sh\" \"$p\" run --warp \"$rel:$ZED_ROW\""
+    ],
+    "env": {
+      "RENPY_ZED_TASK": "warp"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "Ren'Py: run from label $ZED_CUSTOM_renpy_label",
+    "command": "sh",
+    "args": [
+      "-c",
+      "f=\"$ZED_FILE\"; p=$(printf '%s' \"$f\" | sed 's|\\(.*\\)/game/.*|\\1|'); rel=\"game/$(printf '%s' \"$f\" | sed 's|.*/game/||')\"; if [ \"$p\" = \"$f\" ]; then echo \"$f is not inside a game/ folder\" >&2; exit 1; fi; s=\"$RENPY_SDK\"; if [ -z \"$s\" ]; then s=$(find \"$HOME\" \"$HOME/Documents\" \"$HOME/Downloads\" \"$HOME/Desktop\" -maxdepth 1 -type d -name 'renpy-*-sdk' 2>/dev/null | awk -F/ '{print $NF \"\\t\" $0}' | sort -V | tail -n 1 | cut -f 2); fi; if [ ! -f \"$s/renpy.sh\" ]; then echo 'No Ren-Py SDK found: set RENPY_SDK to the SDK folder' >&2; exit 1; fi; exec \"$s/renpy.sh\" \"$p\" run --warp \"$rel:$ZED_ROW\""
+    ],
+    "env": {
+      "RENPY_ZED_TASK": "warp"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always",
+    "tags": [
+      "renpy-label"
+    ]
+  },
+  {
+    "label": "Ren'Py: lint",
+    "command": "sh",
+    "args": [
+      "-c",
+      "f=\"$ZED_FILE\"; p=$(printf '%s' \"$f\" | sed 's|\\(.*\\)/game/.*|\\1|'); rel=\"game/$(printf '%s' \"$f\" | sed 's|.*/game/||')\"; if [ \"$p\" = \"$f\" ]; then echo \"$f is not inside a game/ folder\" >&2; exit 1; fi; s=\"$RENPY_SDK\"; if [ -z \"$s\" ]; then s=$(find \"$HOME\" \"$HOME/Documents\" \"$HOME/Downloads\" \"$HOME/Desktop\" -maxdepth 1 -type d -name 'renpy-*-sdk' 2>/dev/null | awk -F/ '{print $NF \"\\t\" $0}' | sort -V | tail -n 1 | cut -f 2); fi; if [ ! -f \"$s/renpy.sh\" ]; then echo 'No Ren-Py SDK found: set RENPY_SDK to the SDK folder' >&2; exit 1; fi; exec \"$s/renpy.sh\" \"$p\" lint"
+    ],
+    "env": {
+      "RENPY_ZED_TASK": "lint"
+    },
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]

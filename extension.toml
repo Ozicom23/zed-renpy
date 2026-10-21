@@ -5,12 +5,15 @@ version = "0.2.0"
 schema_version = 1
 authors = ["Denys Berezovskyi <berezovskyidenys@gmail.com>"]
 repository = "https://github.com/Ozicom23/zed-renpy"
+snippets = ["./snippets/ren'py.json"]
 
 [language_servers.renpy-language-server]
 name = "Ren'Py Language Server"
 languages = ["Ren'Py"]
 
 [debug_adapters.renpy]
+
+[debug_locators.renpy]
 
 [grammars.renpy]
 repository = "https://github.com/Ozicom23/zed-renpy"
