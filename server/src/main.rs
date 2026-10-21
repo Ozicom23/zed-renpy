@@ -1,30 +1,40 @@
 //! A minimal language server for Ren'Py scripts.
 //!
 //! Indexes every `.rpy`/`.rpym` file in the workspace at startup (and re-indexes
-//! open files as they change) and answers:
-//!   - textDocument/definition  — jump/call targets, speakers, defines, images,
-//!     screens, transforms, styles
-//!   - workspace/symbol         — project-wide symbol search
+//! open files as they change), plus the image files Ren'Py defines images
+//! from, and answers definition, references, rename, completion, hover,
+//! signature help, code actions, document colors and workspace symbols.
 //!
 //! Parsing is line-based: Ren'Py definition statements always start a line, so a
 //! full AST is unnecessary for indexing declaration sites.
 
+mod colors;
 mod dap;
+mod images;
 mod renpy_cli;
+mod signature;
+mod stats;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use lsp_server::{Connection, Message, Notification, Response};
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Documentation, GotoDefinitionParams, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent, MarkupKind,
-    OneOf, Position, PublishDiagnosticsParams, Range, ReferenceParams, RenameParams,
-    ServerCapabilities, SymbolInformation, SymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url,
-    WorkspaceEdit, WorkspaceSymbolParams,
+    CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, Color, ColorInformation, ColorPresentation,
+    ColorPresentationParams, ColorProviderCapability, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, CompletionResponse, CreateFile, CreateFileOptions,
+    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
+    DocumentChanges, DocumentColorParams, Documentation, FileChangeType, GotoDefinitionParams,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, Location,
+    MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier,
+    ParameterInformation, ParameterLabel, Position, PublishDiagnosticsParams, Range,
+    ReferenceParams, RenameParams, ResourceOp, ServerCapabilities, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SignatureInformation, SymbolInformation,
+    SymbolKind, TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Url, WorkspaceEdit,
+    WorkspaceSymbolParams,
 };
 
 #[derive(Clone)]
@@ -38,7 +48,8 @@ struct Definition {
     doc: Option<String>,
 }
 
-/// A `jump`/`call` usage of a label name.
+/// A `jump`/`call` usage of a label name, or the image tag of a
+/// `show`/`scene`/`hide`.
 struct Reference {
     name: String,
     range: Range,
@@ -54,11 +65,27 @@ struct Index {
     file_refs: HashMap<Url, Vec<Reference>>,
     /// open-buffer contents, overriding what is on disk
     open_docs: HashMap<Url, String>,
+    /// file -> image tags its show/scene/hide statements use
+    image_refs: HashMap<Url, Vec<Reference>>,
+    /// file -> tags it makes up with `show x as alias`, or defines with a
+    /// literal `renpy.image("name", ...)`
+    extra_image_tags: HashMap<Url, Vec<String>>,
+    /// files defining images from Python with a computed name, which makes the
+    /// set of image names unknowable
+    dynamic_images: HashSet<Url>,
+    /// image files currently indexed as definitions (keys of file_names)
+    image_files: Vec<Url>,
+    /// file -> its dialogue lines, for statistics
+    dialogue: HashMap<Url, Vec<stats::Dialogue>>,
 }
 
 impl Index {
     fn remove_file(&mut self, uri: &Url) {
         self.file_refs.remove(uri);
+        self.image_refs.remove(uri);
+        self.extra_image_tags.remove(uri);
+        self.dynamic_images.remove(uri);
+        self.dialogue.remove(uri);
         if let Some(names) = self.file_names.remove(uri) {
             for name in names {
                 if let Some(defs) = self.defs.get_mut(&name) {
@@ -75,12 +102,33 @@ impl Index {
         self.remove_file(uri);
         let mut names = Vec::new();
         let mut refs = Vec::new();
+        let mut image_refs = Vec::new();
+        let mut extra_tags = Vec::new();
         let mut pending_doc: Vec<String> = Vec::new();
         for (line_no, line) in text.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.starts_with('#') {
                 pending_doc.push(trimmed.trim_start_matches('#').trim().to_string());
                 continue;
+            }
+            if let Some((tag, start, end)) = images::parse_image_reference(line) {
+                image_refs.push(Reference {
+                    name: tag,
+                    range: Range {
+                        start: Position { line: line_no as u32, character: start as u32 },
+                        end: Position { line: line_no as u32, character: end as u32 },
+                    },
+                });
+            }
+            if let Some(alias) = images::parse_show_alias(line) {
+                extra_tags.push(alias.to_string());
+            }
+            match images::parse_python_image_definition(line) {
+                Some(Ok(name)) => extra_tags.push(name),
+                Some(Err(())) => {
+                    self.dynamic_images.insert(uri.clone());
+                }
+                None => {}
             }
             if let Some((name, start, end)) = parse_reference(line) {
                 refs.push(Reference {
@@ -118,11 +166,64 @@ impl Index {
         }
         self.file_names.insert(uri.clone(), names);
         self.file_refs.insert(uri.clone(), refs);
+        self.image_refs.insert(uri.clone(), image_refs);
+        self.extra_image_tags.insert(uri.clone(), extra_tags);
+        // Translations repeat the dialogue; statistics count the original.
+        let is_translation = uri.path().contains("/game/tl/");
+        if !is_translation {
+            self.dialogue.insert(uri.clone(), stats::scan(text));
+        }
+    }
+
+    /// Replace the indexed image files with `files` (one project scan).
+    fn set_image_files(&mut self, files: &[images::ImageFile]) {
+        for uri in std::mem::take(&mut self.image_files) {
+            self.remove_file(&uri);
+        }
+        for file in files {
+            let Ok(uri) = Url::from_file_path(&file.path) else { continue };
+            let mut names = vec![file.name.clone()];
+            let tag = file.name.split(' ').next().unwrap_or("").to_string();
+            if tag != file.name {
+                names.push(tag);
+            }
+            for name in &names {
+                self.defs.entry(name.clone()).or_default().push(Definition {
+                    uri: uri.clone(),
+                    range: Range::default(),
+                    kind: SymbolKind::CONSTANT,
+                    detail: format!("image {} = \"{}\"", file.name, image_relative_path(&file.path)),
+                    doc: None,
+                });
+            }
+            self.file_names.insert(uri.clone(), names);
+            self.image_files.push(uri);
+        }
+    }
+
+    /// Every image tag the project defines, or None when it defines images
+    /// with computed names (then any tag may exist).
+    fn known_image_tags(&self) -> Option<HashSet<&str>> {
+        if !self.dynamic_images.is_empty() {
+            return None;
+        }
+        let mut tags: HashSet<&str> = images::BUILTIN_IMAGES.iter().copied().collect();
+        for (name, defs) in &self.defs {
+            if defs.iter().any(|d| d.kind == SymbolKind::CONSTANT) {
+                tags.insert(name.split(' ').next().unwrap_or(name));
+            }
+        }
+        for extra in self.extra_image_tags.values().flatten() {
+            tags.insert(extra.split(' ').next().unwrap_or(extra));
+        }
+        Some(tags)
     }
 
     /// Project-wide checks: jump/call targets that are not defined anywhere,
-    /// and labels defined more than once. Leading-dot local labels are skipped
-    /// (their resolution depends on the enclosing global label).
+    /// labels defined more than once, and show/scene/hide of images that do
+    /// not exist. Leading-dot local labels are skipped (their resolution
+    /// depends on the enclosing global label). Each diagnostic's `data` names
+    /// the quick fix that applies (see `code_actions`).
     fn compute_diagnostics(&self) -> HashMap<Url, Vec<Diagnostic>> {
         let mut out: HashMap<Url, Vec<Diagnostic>> = HashMap::new();
         let labels: std::collections::HashSet<&str> = self
@@ -137,11 +238,22 @@ impl Index {
                     continue;
                 }
                 if !labels.contains(reference.name.as_str()) {
+                    let suggestion = images::closest(&reference.name, labels.iter().copied());
+                    let mut message =
+                        format!("label '{}' is not defined anywhere in the project", reference.name);
+                    if let Some(s) = suggestion {
+                        message.push_str(&format!(" (did you mean '{s}'?)"));
+                    }
                     out.entry(uri.clone()).or_default().push(Diagnostic {
                         range: reference.range,
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("renpy".into()),
-                        message: format!("label '{}' is not defined anywhere in the project", reference.name),
+                        message,
+                        data: Some(serde_json::json!({
+                            "fix": "undefined_label",
+                            "name": reference.name,
+                            "suggestion": suggestion,
+                        })),
                         ..Default::default()
                     });
                 }
@@ -160,6 +272,46 @@ impl Index {
                         severity: Some(DiagnosticSeverity::WARNING),
                         source: Some("renpy".into()),
                         message: format!("label '{}' is defined {} times", name, sites.len()),
+                        related_information: Some(
+                            sites
+                                .iter()
+                                .filter(|other| other.uri != site.uri || other.range != site.range)
+                                .map(|other| lsp_types::DiagnosticRelatedInformation {
+                                    location: Location { uri: other.uri.clone(), range: other.range },
+                                    message: format!("label '{name}' is also defined here"),
+                                })
+                                .collect(),
+                        ),
+                        data: Some(serde_json::json!({ "fix": "duplicate_label", "name": name })),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        if let Some(tags) = self.known_image_tags() {
+            for (uri, refs) in &self.image_refs {
+                for reference in refs {
+                    if tags.contains(reference.name.as_str()) {
+                        continue;
+                    }
+                    let suggestion = images::closest(&reference.name, tags.iter().copied());
+                    let mut message = format!(
+                        "image '{}' is not defined: no image statement, layeredimage or file in game/images uses this tag",
+                        reference.name
+                    );
+                    if let Some(s) = suggestion {
+                        message.push_str(&format!(" (did you mean '{s}'?)"));
+                    }
+                    out.entry(uri.clone()).or_default().push(Diagnostic {
+                        range: reference.range,
+                        severity: Some(DiagnosticSeverity::WARNING),
+                        source: Some("renpy".into()),
+                        message,
+                        data: Some(serde_json::json!({
+                            "fix": "unknown_image",
+                            "name": reference.name,
+                            "suggestion": suggestion,
+                        })),
                         ..Default::default()
                     });
                 }
@@ -399,6 +551,15 @@ fn parse_definitions(line: &str) -> Vec<(String, usize, usize, SymbolKind)> {
         return out;
     }
 
+    // layeredimage NAME:  (an image tag with its attributes in the block)
+    if let Some(p) = eat_keyword(l, indent, "layeredimage") {
+        let (name, end) = take_ident(l, p);
+        if !name.is_empty() {
+            out.push((name.to_string(), p, end, SymbolKind::CONSTANT));
+        }
+        return out;
+    }
+
     // screen NAME(...):  |  transform NAME:  |  style NAME:
     for (kw, kind) in [
         ("screen", SymbolKind::CLASS),
@@ -473,6 +634,19 @@ fn word_at(text: &str, position: Position) -> Option<String> {
     } else {
         Some(line[start..end].to_string())
     }
+}
+
+/// `images/bg/room.png` for a file in `<project>/game/images/bg/room.png`.
+fn image_relative_path(path: &Path) -> String {
+    let full = path.to_string_lossy().replace('\\', "/");
+    match full.rfind("/game/") {
+        Some(pos) => full[pos + "/game/".len()..].to_string(),
+        None => full,
+    }
+}
+
+fn is_image_file(path: &Path) -> bool {
+    images::image_name_for(path).is_some()
 }
 
 fn is_renpy_file(path: &Path) -> bool {
@@ -583,6 +757,23 @@ impl BuiltinDocs {
             ));
         }
         Some(text)
+    }
+
+    /// `Character(name=NotSet, kind=None, **properties)` and its docs, for
+    /// built-in functions and classes.
+    fn signature(&self, name: &str) -> Option<(String, Option<String>)> {
+        let entry = self
+            .renpy
+            .get(name)
+            .or_else(|| self.config.get(name))
+            .or_else(|| self.internal.get(name))?;
+        let kind = entry.get(1).and_then(|v| v.as_str()).unwrap_or("");
+        let signature = entry.get(2).and_then(|v| v.as_str()).unwrap_or("");
+        if !matches!(kind, "function" | "class") || !signature.starts_with('(') {
+            return None;
+        }
+        let doc = entry.get(5).and_then(|v| v.as_str()).map(str::trim).filter(|d| !d.is_empty());
+        Some((format!("{name}{signature}"), doc.map(String::from)))
     }
 
     fn completions(&self) -> Vec<CompletionItem> {
@@ -901,6 +1092,348 @@ fn publish_diagnostics(
     Ok(())
 }
 
+/// Where a new statement goes at the end of `text`, and the text to insert
+/// so it starts on a fresh line after one blank line.
+fn end_of_document(text: &str) -> Position {
+    if text.is_empty() || text.ends_with('\n') {
+        Position { line: text.lines().count() as u32, character: 0 }
+    } else {
+        let last = text.lines().last().unwrap_or("");
+        Position {
+            line: text.lines().count().saturating_sub(1) as u32,
+            character: last.encode_utf16().count() as u32,
+        }
+    }
+}
+
+fn ranges_overlap(a: &Range, b: &Range) -> bool {
+    let before = |x: &Position, y: &Position| (x.line, x.character) < (y.line, y.character);
+    !before(&a.end, &b.start) && !before(&b.end, &a.start)
+}
+
+fn quick_fix(title: String, uri: &Url, edits: Vec<TextEdit>, diagnostic: &Diagnostic, preferred: bool) -> CodeActionOrCommand {
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), edits)])),
+            ..Default::default()
+        }),
+        is_preferred: Some(preferred),
+        ..Default::default()
+    })
+}
+
+/// Quick fixes for the diagnostics under `range`. They are recomputed from
+/// the index rather than read from the client's copy of the diagnostics.
+fn code_actions(index: &Index, uri: &Url, range: Range, text: &str) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    let diagnostics = index.compute_diagnostics();
+    let Some(file_diagnostics) = diagnostics.get(uri) else { return actions };
+    for diagnostic in file_diagnostics {
+        if !ranges_overlap(&diagnostic.range, &range) {
+            continue;
+        }
+        let Some(data) = &diagnostic.data else { continue };
+        let name = data["name"].as_str().unwrap_or_default();
+        let suggestion = data["suggestion"].as_str();
+        match data["fix"].as_str() {
+            Some("undefined_label") => {
+                if let Some(s) = suggestion {
+                    actions.push(quick_fix(
+                        format!("Change to '{s}'"),
+                        uri,
+                        vec![TextEdit { range: diagnostic.range, new_text: s.to_string() }],
+                        diagnostic,
+                        true,
+                    ));
+                }
+                let separator = if text.is_empty() || text.ends_with("\n\n") {
+                    ""
+                } else if text.ends_with('\n') {
+                    "\n"
+                } else {
+                    "\n\n"
+                };
+                let at = end_of_document(text);
+                actions.push(quick_fix(
+                    format!("Create label '{name}' at the end of this file"),
+                    uri,
+                    vec![TextEdit {
+                        range: Range { start: at, end: at },
+                        new_text: format!("{separator}label {name}:\n    return\n"),
+                    }],
+                    diagnostic,
+                    suggestion.is_none(),
+                ));
+            }
+            Some("duplicate_label") => {
+                let free = (2..)
+                    .map(|n| format!("{name}_{n}"))
+                    .find(|candidate| !index.defs.contains_key(candidate))
+                    .unwrap_or_default();
+                actions.push(quick_fix(
+                    format!("Rename this label to '{free}'"),
+                    uri,
+                    vec![TextEdit { range: diagnostic.range, new_text: free.clone() }],
+                    diagnostic,
+                    false,
+                ));
+            }
+            Some("unknown_image") => {
+                if let Some(s) = suggestion {
+                    actions.push(quick_fix(
+                        format!("Change to '{s}'"),
+                        uri,
+                        vec![TextEdit { range: diagnostic.range, new_text: s.to_string() }],
+                        diagnostic,
+                        true,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    actions
+}
+
+/// The source text up to `position`, with up to 20 lines before it, so calls
+/// whose arguments span lines are still found.
+fn text_before(text: &str, position: Position) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let line_idx = position.line as usize;
+    let Some(line) = lines.get(line_idx) else { return String::new() };
+    let first = line_idx.saturating_sub(20);
+    let mut out = lines[first..line_idx].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&line[..utf16_col_to_byte(line, position.character)]);
+    out
+}
+
+/// Parameter hints for Ren'Py built-ins (`Character(`, `renpy.pause(`,
+/// actions) and the project's own labels, screens and transforms.
+fn signature_help(index: &Index, docs: &BuiltinDocs, text: &str, position: Position) -> Option<SignatureHelp> {
+    let site = signature::call_at(&text_before(text, position))?;
+    let (label, documentation) = if let Some((sig, doc)) = docs.signature(&site.name) {
+        (sig, doc)
+    } else {
+        let def = index.defs.get(&site.name)?.iter().find(|d| {
+            matches!(d.kind, SymbolKind::FUNCTION | SymbolKind::CLASS | SymbolKind::METHOD)
+                && d.detail.contains('(')
+        })?;
+        (def.detail.trim_end_matches(':').trim_end().to_string(), def.doc.clone())
+    };
+    let list = signature::parameter_list(&label)?;
+    let parameters = signature::split_parameters(list);
+    // Parameter labels as UTF-16 offsets into `label`, so repeated names are
+    // highlighted at the right place.
+    let list_start = label.find(list).unwrap_or(0);
+    let mut search_from = list_start;
+    let mut infos = Vec::new();
+    for parameter in &parameters {
+        let Some(found) = label[search_from..].find(parameter.as_str()) else { break };
+        let start = search_from + found;
+        let end = start + parameter.len();
+        search_from = end;
+        infos.push(ParameterInformation {
+            label: ParameterLabel::LabelOffsets([
+                label[..start].encode_utf16().count() as u32,
+                label[..end].encode_utf16().count() as u32,
+            ]),
+            documentation: None,
+        });
+    }
+    let active = signature::active_parameter(&parameters, &site);
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: documentation.map(|doc| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: truncate_chars(&doc, 1500),
+                })
+            }),
+            parameters: Some(infos),
+            active_parameter: active,
+        }],
+        active_signature: Some(0),
+        active_parameter: active,
+    })
+}
+
+/// Hover text for an image defined by a file: its name and a preview.
+fn image_file_hover(def: &Definition) -> Option<String> {
+    let path = def.uri.to_file_path().ok()?;
+    if !is_image_file(&path) {
+        return None;
+    }
+    let name = images::image_name_for(&path)?;
+    Some(format!(
+        "```renpy\nimage {name}\n```\n\n![{name}]({})\n\n*defined by the file {}*",
+        def.uri,
+        image_relative_path(&path)
+    ))
+}
+
+/// Dialogue statistics for a speaker or a label, shown under its hover.
+fn stats_hover(index: &Index, word: &str) -> Option<String> {
+    let defs = index.defs.get(word)?;
+    let all = || index.dialogue.values().flatten();
+    if defs.iter().any(|d| d.kind == SymbolKind::VARIABLE && d.detail.contains("Character(")) {
+        let mine = stats::by_speaker(all().filter(|d| d.speaker.as_deref() == Some(word)));
+        let tally = mine.get(word).copied().unwrap_or_default();
+        let total: usize = all().map(|d| d.words).sum();
+        let share = if total == 0 { 0.0 } else { tally.words as f64 * 100.0 / total as f64 };
+        return Some(format!(
+            "**Dialogue:** {} lines · {} words · {:.1}% of all words",
+            stats::thousands(tally.lines),
+            stats::thousands(tally.words),
+            share
+        ));
+    }
+    if defs.iter().any(|d| d.kind == SymbolKind::FUNCTION) {
+        let mut tally = stats::Tally::default();
+        for d in all().filter(|d| d.label.as_deref() == Some(word)) {
+            tally.add(d.words);
+        }
+        if tally.lines > 0 {
+            return Some(format!(
+                "**Dialogue in this label:** {} lines · {} words · about {} to read",
+                stats::thousands(tally.lines),
+                stats::thousands(tally.words),
+                stats::reading_time(tally.words)
+            ));
+        }
+    }
+    None
+}
+
+/// The Markdown report written by the "script statistics" source action.
+fn stats_report(index: &Index, roots: &[PathBuf]) -> String {
+    let all: Vec<&stats::Dialogue> = index.dialogue.values().flatten().collect();
+    let total_words: usize = all.iter().map(|d| d.words).sum();
+    let mut out = String::from("# Script statistics\n\n");
+    out.push_str(&format!(
+        "{} lines of dialogue, {} words: about {} to read at 200 words a minute.\n\n",
+        stats::thousands(all.len()),
+        stats::thousands(total_words),
+        stats::reading_time(total_words)
+    ));
+    let share = |words: usize| {
+        if total_words == 0 { 0.0 } else { words as f64 * 100.0 / total_words as f64 }
+    };
+
+    out.push_str("## By character\n\n| Character | Lines | Words | Share |\n|---|---:|---:|---:|\n");
+    let mut speakers: Vec<(String, stats::Tally)> = stats::by_speaker(all.iter().copied()).into_iter().collect();
+    speakers.sort_by(|a, b| b.1.words.cmp(&a.1.words).then_with(|| a.0.cmp(&b.0)));
+    for (who, tally) in &speakers {
+        let display = index
+            .defs
+            .get(who)
+            .and_then(|defs| defs.iter().find_map(|d| stats::character_display_name(&d.detail)))
+            .map(|name| format!("{name} (`{who}`)"))
+            .unwrap_or_else(|| format!("`{who}`"));
+        out.push_str(&format!(
+            "| {display} | {} | {} | {:.1}% |\n",
+            stats::thousands(tally.lines),
+            stats::thousands(tally.words),
+            share(tally.words)
+        ));
+    }
+
+    out.push_str("\n## By file\n\n| File | Lines | Words |\n|---|---:|---:|\n");
+    let mut files: Vec<(String, stats::Tally)> = index
+        .dialogue
+        .iter()
+        .filter(|(_, lines)| !lines.is_empty())
+        .map(|(uri, lines)| {
+            let path = uri.to_file_path().unwrap_or_default();
+            let display = roots
+                .iter()
+                .find_map(|root| path.strip_prefix(root).ok().map(|r| r.display().to_string()))
+                .unwrap_or_else(|| path.display().to_string());
+            let mut tally = stats::Tally::default();
+            for d in lines {
+                tally.add(d.words);
+            }
+            (display, tally)
+        })
+        .collect();
+    files.sort_by(|a, b| b.1.words.cmp(&a.1.words).then_with(|| a.0.cmp(&b.0)));
+    for (file, tally) in &files {
+        out.push_str(&format!(
+            "| {file} | {} | {} |\n",
+            stats::thousands(tally.lines),
+            stats::thousands(tally.words)
+        ));
+    }
+
+    out.push_str("\n## Longest labels\n\n| Label | Lines | Words | Reading time |\n|---|---:|---:|---:|\n");
+    let mut labels: HashMap<&str, stats::Tally> = HashMap::new();
+    for d in &all {
+        if let Some(label) = &d.label {
+            labels.entry(label.as_str()).or_default().add(d.words);
+        }
+    }
+    let mut labels: Vec<(&str, stats::Tally)> = labels.into_iter().collect();
+    labels.sort_by(|a, b| b.1.words.cmp(&a.1.words).then_with(|| a.0.cmp(b.0)));
+    for (label, tally) in labels.iter().take(25) {
+        out.push_str(&format!(
+            "| `{label}` | {} | {} | {} |\n",
+            stats::thousands(tally.lines),
+            stats::thousands(tally.words),
+            stats::reading_time(tally.words)
+        ));
+    }
+    out.push_str(
+        "\n*Counted by the Ren'Py extension for Zed: dialogue and narration lines, \
+         without text tags; translations under game/tl are not counted.*\n",
+    );
+    out
+}
+
+/// The source action that writes `script_stats.md` into the project.
+fn stats_action(index: &Index, roots: &[PathBuf], project: &Path) -> Option<CodeActionOrCommand> {
+    let path = project.join("script_stats.md");
+    let uri = Url::from_file_path(&path).ok()?;
+    let report = stats_report(index, roots);
+    let mut operations = Vec::new();
+    let range = match std::fs::read_to_string(&path) {
+        Ok(existing) => Range { start: Position::default(), end: end_of_document(&existing) },
+        Err(_) => {
+            operations.push(DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                uri: uri.clone(),
+                options: Some(CreateFileOptions { overwrite: Some(false), ignore_if_exists: Some(true) }),
+                annotation_id: None,
+            })));
+            Range::default()
+        }
+    };
+    operations.push(DocumentChangeOperation::Edit(TextDocumentEdit {
+        text_document: OptionalVersionedTextDocumentIdentifier { uri, version: None },
+        edits: vec![OneOf::Left(TextEdit { range, new_text: report })],
+    }));
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Write Ren'Py script statistics to script_stats.md".into(),
+        kind: Some(CodeActionKind::SOURCE),
+        edit: Some(WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Operations(operations)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }))
+}
+
+/// Re-read image files of every project after something under them changed.
+fn rescan_images(index: &mut Index, projects: &[PathBuf]) {
+    let files: Vec<images::ImageFile> =
+        projects.iter().flat_map(|project| images::scan_project_images(project)).collect();
+    index.set_image_files(&files);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     match std::env::args().nth(1).as_deref() {
         Some("dap") => return dap::run(),
@@ -939,6 +1472,16 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
         }),
         references_provider: Some(OneOf::Left(true)),
         rename_provider: Some(OneOf::Left(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: Default::default(),
+        }),
+        code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+            code_action_kinds: Some(vec![CodeActionKind::QUICKFIX, CodeActionKind::SOURCE]),
+            ..Default::default()
+        })),
+        color_provider: Some(ColorProviderCapability::Simple(true)),
         ..Default::default()
     })?;
     let init_value = connection.initialize(capabilities)?;
@@ -966,11 +1509,33 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
             );
         }
     }
+    let projects: Vec<PathBuf> = roots.iter().filter_map(|root| renpy_cli::find_project(root)).collect();
+    // The script statistics action creates a file, which needs the client to
+    // apply resource operations.
+    let can_create_files = init
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.workspace_edit.as_ref())
+        .is_some_and(|edit| {
+            edit.document_changes == Some(true)
+                && edit
+                    .resource_operations
+                    .as_ref()
+                    .is_some_and(|ops| ops.contains(&lsp_types::ResourceOperationKind::Create))
+        });
+    let can_watch_files = init
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.did_change_watched_files.as_ref())
+        .and_then(|c| c.dynamic_registration)
+        .unwrap_or(false);
     let (lint_tx, lint_rx) = crossbeam_channel::unbounded();
     let mut lint = LintRunner {
         enabled: options.get("lint").and_then(|v| v.as_bool()).unwrap_or(true),
         sdk: sdk_override.filter(|p| renpy_cli::is_sdk_dir(p)).or_else(renpy_cli::find_sdk),
-        project: roots.iter().find_map(|root| renpy_cli::find_project(root)),
+        project: projects.first().cloned(),
         running: false,
         pending: false,
         tx: lint_tx,
@@ -991,10 +1556,12 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
             }
         }
     }
+    rescan_images(&mut index, &projects);
     eprintln!(
-        "renpy-language-server: indexed {} symbols from {} files in {} workspace root(s); {} built-in API docs loaded (Ren'Py {})",
+        "renpy-language-server: indexed {} symbols from {} files and {} image files in {} workspace root(s); {} built-in API docs loaded (Ren'Py {})",
         index.defs.len(),
         file_count,
+        index.image_files.len(),
         roots.len(),
         builtin_docs.len(),
         RENPY_DOCS_VERSION
@@ -1022,6 +1589,24 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     // notification, so post-handshake work starts here, not in the loop.
     publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
     lint.request();
+    if can_watch_files {
+        // Scripts edited outside Zed, and image files added or renamed.
+        let watchers: Vec<serde_json::Value> = ["**/*.rpy", "**/*.rpym", "**/game/images/**"]
+            .iter()
+            .map(|glob| serde_json::json!({ "globPattern": glob }))
+            .collect();
+        connection.sender.send(Message::Request(lsp_server::Request {
+            id: lsp_server::RequestId::from("renpy-watch-files".to_string()),
+            method: "client/registerCapability".into(),
+            params: serde_json::json!({
+                "registrations": [{
+                    "id": "renpy-watch-files",
+                    "method": "workspace/didChangeWatchedFiles",
+                    "registerOptions": { "watchers": watchers },
+                }]
+            }),
+        }))?;
+    }
 
     enum Incoming {
         Client(Message),
@@ -1147,10 +1732,16 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                                 let markdown = text
                                     .and_then(|t| word_at(&t, doc_pos.position))
                                     .and_then(|word| {
-                                        index
-                                            .lookup_defs(&word)
-                                            .map(|defs| project_hover_markdown(defs, &roots))
-                                            .or_else(|| builtin_docs.hover_markdown(&word))
+                                        let project = index.lookup_defs(&word).map(|defs| {
+                                            let mut text = image_file_hover(&defs[0])
+                                                .unwrap_or_else(|| project_hover_markdown(defs, &roots));
+                                            if let Some(stats) = stats_hover(&index, &word) {
+                                                text.push_str("\n\n");
+                                                text.push_str(&stats);
+                                            }
+                                            text
+                                        });
+                                        project.or_else(|| builtin_docs.hover_markdown(&word))
                                     });
                                 let result = match markdown {
                                     Some(value) => serde_json::to_value(Hover {
@@ -1245,6 +1836,97 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                         };
                         connection.sender.send(Message::Response(resp))?;
                     }
+                    "textDocument/signatureHelp" => {
+                        let resp = match serde_json::from_value::<SignatureHelpParams>(req.params) {
+                            Ok(params) => {
+                                let doc_pos = &params.text_document_position_params;
+                                let uri = &doc_pos.text_document.uri;
+                                let text = index.open_docs.get(uri).cloned().or_else(|| {
+                                    uri.to_file_path().ok().and_then(|p| std::fs::read_to_string(p).ok())
+                                });
+                                let help = text.and_then(|t| {
+                                    signature_help(&index, &builtin_docs, &t, doc_pos.position)
+                                });
+                                Response::new_ok(req.id, serde_json::to_value(help)?)
+                            }
+                            Err(err) => Response::new_err(req.id, -32602, err.to_string()),
+                        };
+                        connection.sender.send(Message::Response(resp))?;
+                    }
+                    "textDocument/codeAction" => {
+                        let resp = match serde_json::from_value::<CodeActionParams>(req.params) {
+                            Ok(params) => {
+                                let uri = &params.text_document.uri;
+                                let text = index.open_docs.get(uri).cloned().or_else(|| {
+                                    uri.to_file_path().ok().and_then(|p| std::fs::read_to_string(p).ok())
+                                });
+                                let mut actions = text
+                                    .map(|t| code_actions(&index, uri, params.range, &t))
+                                    .unwrap_or_default();
+                                let wants = |kind: &CodeActionKind| {
+                                    params.context.only.as_ref().is_none_or(|only| {
+                                        only.iter().any(|o| kind.as_str().starts_with(o.as_str()))
+                                    })
+                                };
+                                actions.retain(|action| match action {
+                                    CodeActionOrCommand::CodeAction(a) => a.kind.as_ref().is_none_or(wants),
+                                    CodeActionOrCommand::Command(_) => true,
+                                });
+                                if can_create_files && wants(&CodeActionKind::SOURCE) {
+                                    if let Some(project) = projects.first() {
+                                        actions.extend(stats_action(&index, &roots, project));
+                                    }
+                                }
+                                Response::new_ok(req.id, serde_json::to_value(actions)?)
+                            }
+                            Err(err) => Response::new_err(req.id, -32602, err.to_string()),
+                        };
+                        connection.sender.send(Message::Response(resp))?;
+                    }
+                    "textDocument/documentColor" => {
+                        let resp = match serde_json::from_value::<DocumentColorParams>(req.params) {
+                            Ok(params) => {
+                                let uri = &params.text_document.uri;
+                                let text = index.open_docs.get(uri).cloned().or_else(|| {
+                                    uri.to_file_path().ok().and_then(|p| std::fs::read_to_string(p).ok())
+                                });
+                                let found: Vec<ColorInformation> = colors::find_colors(&text.unwrap_or_default())
+                                    .into_iter()
+                                    .map(|c| ColorInformation {
+                                        range: Range {
+                                            start: Position { line: c.line, character: c.start },
+                                            end: Position { line: c.line, character: c.end },
+                                        },
+                                        color: Color {
+                                            red: c.rgba[0],
+                                            green: c.rgba[1],
+                                            blue: c.rgba[2],
+                                            alpha: c.rgba[3],
+                                        },
+                                    })
+                                    .collect();
+                                Response::new_ok(req.id, serde_json::to_value(found)?)
+                            }
+                            Err(err) => Response::new_err(req.id, -32602, err.to_string()),
+                        };
+                        connection.sender.send(Message::Response(resp))?;
+                    }
+                    "textDocument/colorPresentation" => {
+                        let resp = match serde_json::from_value::<ColorPresentationParams>(req.params) {
+                            Ok(params) => {
+                                let c = params.color;
+                                let label = colors::presentation([c.red, c.green, c.blue, c.alpha]);
+                                let presentation = ColorPresentation {
+                                    text_edit: Some(TextEdit { range: params.range, new_text: label.clone() }),
+                                    label,
+                                    additional_text_edits: None,
+                                };
+                                Response::new_ok(req.id, serde_json::to_value(vec![presentation])?)
+                            }
+                            Err(err) => Response::new_err(req.id, -32602, err.to_string()),
+                        };
+                        connection.sender.send(Message::Response(resp))?;
+                    }
                     "workspace/symbol" => {
                         let resp = match serde_json::from_value::<WorkspaceSymbolParams>(req.params) {
                             Ok(params) => {
@@ -1311,6 +1993,30 @@ fn run_lsp() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
                 }
                 "textDocument/didSave" => {
                     lint.request();
+                }
+                "workspace/didChangeWatchedFiles" => {
+                    if let Ok(params) = serde_json::from_value::<DidChangeWatchedFilesParams>(note.params) {
+                        let mut images_changed = false;
+                        for change in params.changes {
+                            let Ok(path) = change.uri.to_file_path() else { continue };
+                            if is_renpy_file(&path) {
+                                if index.open_docs.contains_key(&change.uri) {
+                                    continue; // the buffer is the source of truth
+                                }
+                                match (change.typ, std::fs::read_to_string(&path)) {
+                                    (FileChangeType::DELETED, _) | (_, Err(_)) => index.remove_file(&change.uri),
+                                    (_, Ok(text)) => index.index_file(&change.uri, &text),
+                                }
+                            } else {
+                                // an image, or a directory of them
+                                images_changed = true;
+                            }
+                        }
+                        if images_changed {
+                            rescan_images(&mut index, &projects);
+                        }
+                        publish_diagnostics(&connection, &index, &lint_diags, &mut published)?;
+                    }
                 }
                 "textDocument/didClose" => {
                     if let Ok(params) = serde_json::from_value::<DidCloseTextDocumentParams>(note.params) {
@@ -1520,6 +2226,117 @@ mod tests {
         let character = docs.hover_markdown("Character").unwrap();
         assert!(character.contains("Character(name="), "{character}");
         assert!(docs.hover_markdown("definitely_not_a_builtin_xyz").is_none());
+    }
+
+    #[test]
+    fn unknown_images_are_flagged_with_suggestions() {
+        let mut index = Index::default();
+        let a = Url::parse("file:///tmp/a.rpy").unwrap();
+        index.index_file(
+            &a,
+            "image eileen happy = \"e.png\"\nlayeredimage lucy:\n    always:\n        \"lucy\"\nlabel start:\n    scene bg room\n    show eileen happy\n    show eilen sad\n    show lucy\n    show black\n    show ghost as spooky\n    hide spooky\n    show screen hud\n    $ renpy.image(\"bg night\", Solid(\"#000\"))\n    scene bg night\n",
+        );
+        index.set_image_files(&[images::ImageFile {
+            name: "bg room".into(),
+            path: PathBuf::from("/tmp/game/images/bg room.png"),
+        }]);
+        let diags = index.compute_diagnostics();
+        let messages: Vec<&str> = diags[&a].iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages[0].starts_with("image 'eilen' is not defined") && messages[0].ends_with("(did you mean 'eileen'?)"));
+        assert!(messages[1].starts_with("image 'ghost' is not defined"));
+        // The image file is a definition with a path, and resolves the tag.
+        let defs = index.lookup_defs("bg room").unwrap();
+        assert_eq!(defs[0].detail, "image bg room = \"images/bg room.png\"");
+        assert!(index.lookup_defs("bg").is_some());
+        // Rescanning replaces old image files.
+        index.set_image_files(&[]);
+        assert!(index.lookup_defs("bg room").is_none());
+        // A computed renpy.image() name makes every tag possible.
+        let b = Url::parse("file:///tmp/b.rpy").unwrap();
+        index.index_file(&b, "init python:\n    for n in names:\n        renpy.image(n, Solid(\"#000\"))\n");
+        assert!(!index.compute_diagnostics().contains_key(&a));
+    }
+
+    #[test]
+    fn quick_fixes_for_labels_and_images() {
+        let mut index = Index::default();
+        let a = Url::parse("file:///tmp/a.rpy").unwrap();
+        let text = "image eileen = \"e.png\"\nlabel start:\n    jump shopp\n    jump nowhere\n    show eilen\nlabel shop:\n    return\nlabel shop:\n    return";
+        index.index_file(&a, text);
+        let at = |line: u32| Range {
+            start: Position { line, character: 0 },
+            end: Position { line, character: 99 },
+        };
+        let titles = |line: u32| -> Vec<String> {
+            code_actions(&index, &a, at(line), text)
+                .into_iter()
+                .map(|action| match action {
+                    CodeActionOrCommand::CodeAction(a) => a.title,
+                    CodeActionOrCommand::Command(c) => c.title,
+                })
+                .collect()
+        };
+        assert_eq!(titles(2), vec!["Change to 'shop'", "Create label 'shopp' at the end of this file"]);
+        assert_eq!(titles(3), vec!["Create label 'nowhere' at the end of this file"]);
+        assert_eq!(titles(4), vec!["Change to 'eileen'"]);
+        assert_eq!(titles(5), vec!["Rename this label to 'shop_2'"]);
+        assert!(titles(1).is_empty());
+        // The new label goes after the last line, on a fresh line.
+        let CodeActionOrCommand::CodeAction(create) = code_actions(&index, &a, at(3), text).remove(0) else {
+            panic!()
+        };
+        let edit = &create.edit.unwrap().changes.unwrap()[&a][0];
+        assert_eq!(edit.range.start, Position { line: 8, character: 10 });
+        assert_eq!(edit.new_text, "\n\nlabel nowhere:\n    return\n");
+    }
+
+    #[test]
+    fn parameter_hints_for_builtins_and_project_symbols() {
+        let mut index = Index::default();
+        let a = Url::parse("file:///tmp/a.rpy").unwrap();
+        index.index_file(&a, "label shop(items, discount=0.1):\n    return\nscreen hud(gold):\n    text \"[gold]\"\n");
+        let docs = BuiltinDocs::load();
+        let help = |text: &str| {
+            let line = text.lines().count() as u32 - 1;
+            let character = text.lines().last().unwrap().encode_utf16().count() as u32;
+            signature_help(&index, &docs, text, Position { line, character })
+        };
+        let h = help("define e = Character(\"Eileen\", ").unwrap();
+        let sig = &h.signatures[0];
+        assert!(sig.label.starts_with("Character(name="), "{}", sig.label);
+        assert_eq!(h.active_parameter, Some(1));
+        let h = help("    call shop([], discount=").unwrap();
+        assert_eq!(h.signatures[0].label, "label shop(items, discount=0.1)");
+        assert_eq!(h.active_parameter, Some(1));
+        let ParameterLabel::LabelOffsets([start, end]) = h.signatures[0].parameters.as_ref().unwrap()[1].label else {
+            panic!()
+        };
+        assert_eq!(&h.signatures[0].label[start as usize..end as usize], "discount=0.1");
+        assert_eq!(help("    show screen hud(").unwrap().signatures[0].label, "screen hud(gold)");
+        assert!(help("    $ unknown_function(").is_none());
+    }
+
+    #[test]
+    fn dialogue_statistics_in_hover_and_report() {
+        let mut index = Index::default();
+        let a = Url::parse("file:///tmp/game/a.rpy").unwrap();
+        let tl = Url::parse("file:///tmp/game/tl/french/a.rpy").unwrap();
+        index.index_file(
+            &a,
+            "define e = Character(\"Eileen\")\nlabel start:\n    e \"One two three.\"\n    \"Four five.\"\nlabel other:\n    e \"Six.\"\n",
+        );
+        index.index_file(&tl, "translate french start_1:\n    e \"Un deux trois.\"\n");
+        let hover = stats_hover(&index, "e").unwrap();
+        assert_eq!(hover, "**Dialogue:** 2 lines · 4 words · 66.7% of all words");
+        let hover = stats_hover(&index, "start").unwrap();
+        assert!(hover.starts_with("**Dialogue in this label:** 2 lines · 5 words"), "{hover}");
+        let report = stats_report(&index, &[PathBuf::from("/tmp")]);
+        assert!(report.contains("3 lines of dialogue, 6 words"), "{report}");
+        assert!(report.contains("| Eileen (`e`) | 2 | 4 | 66.7% |"), "{report}");
+        assert!(report.contains("| `narrator` | 1 | 2 | 33.3% |"), "{report}");
+        assert!(report.contains("| game/a.rpy | 3 | 6 |"), "{report}");
+        assert!(report.contains("| `start` | 2 | 5 |"), "{report}");
     }
 
     #[test]

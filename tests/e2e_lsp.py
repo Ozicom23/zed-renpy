@@ -78,15 +78,26 @@ def uri(path):
 script = FIXTURE / "game" / "script.rpy"
 shop = FIXTURE / "game" / "shop.rpy"
 broken = FIXTURE / "game" / "broken.rpy"
+gallery = FIXTURE / "game" / "gallery.rpy"
+bg_room = FIXTURE / "game" / "images" / "bg room.png"
+cg_ending = FIXTURE / "game" / "images" / "cg ending.png"
+if cg_ending.exists():
+    cg_ending.unlink()  # left over from an interrupted run
 
 # --- handshake, with a workspace folder so the startup scan kicks in.
 # Lint is explicitly disabled here: on a machine with a real Ren'Py SDK it
 # would auto-run against the fixture and make diagnostics nondeterministic.
 # The fake-SDK lint flow gets its own deterministic section at the end.
+CLIENT_CAPABILITIES = {
+    "workspace": {
+        "didChangeWatchedFiles": {"dynamicRegistration": True},
+        "workspaceEdit": {"documentChanges": True, "resourceOperations": ["create", "rename", "delete"]},
+    },
+}
 rid = send("initialize", {
     "processId": None,
     "rootUri": uri(FIXTURE),
-    "capabilities": {},
+    "capabilities": CLIENT_CAPABILITIES,
     "workspaceFolders": [{"uri": uri(FIXTURE), "name": "fixture"}],
     "initializationOptions": {"lint": False},
 })
@@ -99,6 +110,13 @@ check("initialize returns completionProvider", isinstance(caps.get("completionPr
 check(
     "initialize returns references + rename providers",
     caps.get("referencesProvider") is True and caps.get("renameProvider") is True,
+)
+check(
+    "initialize returns signature help, code action and color providers",
+    caps.get("signatureHelpProvider", {}).get("triggerCharacters") == ["(", ","]
+    and "quickfix" in caps.get("codeActionProvider", {}).get("codeActionKinds", [])
+    and caps.get("colorProvider") is True,
+    detail=json.dumps(caps),
 )
 send("initialized", {}, is_request=False)
 
@@ -226,7 +244,7 @@ result = read_response(rid).get("result") or []
 labels_offered = [i["label"] for i in result]
 check(
     "completion after 'jump ' offers labels, not variables",
-    {"shop", "start", "dup_label"} == set(labels_offered) and "e" not in labels_offered,
+    {"shop", "start", "dup_label", "gallery"} == set(labels_offered) and "e" not in labels_offered,
     detail=json.dumps(labels_offered),
 )
 
@@ -281,8 +299,10 @@ rid = send("textDocument/references", {
 })
 result = read_response(rid).get("result") or []
 check(
-    "references for speaker 'e' finds define + say line only",
-    len(result) == 2 and all(l["uri"] == uri(script) for l in result),
+    "references for speaker 'e' finds define + say lines only",
+    len(result) == 3
+    and sum(l["uri"] == uri(script) for l in result) == 2
+    and sum(l["uri"] == uri(gallery) for l in result) == 1,
     detail=json.dumps(result),
 )
 
@@ -323,6 +343,125 @@ check(
     "rename of a non-label is refused",
     "error" in resp and "labels only" in resp["error"]["message"],
     detail=json.dumps(resp),
+)
+
+# --- images: files in game/images define images, unknown tags are flagged
+entries = diags_for(gallery)
+latest = entries[-1] if entries else []
+check(
+    "unknown image 'eilen' flagged with a suggestion",
+    any(d["message"].startswith("image 'eilen' is not defined") and "did you mean 'eileen'?" in d["message"]
+        and d["range"]["start"] == {"line": 5, "character": 9} for d in latest),
+    detail=json.dumps(latest),
+)
+check(
+    "image defined by a file in game/images is not flagged",
+    not any(d["message"].startswith("image 'bg'") for d in latest),
+    detail=json.dumps(latest),
+)
+check("unknown image 'cg' flagged before its file exists", any("image 'cg'" in d["message"] for d in latest))
+
+send("textDocument/didOpen", {
+    "textDocument": {"uri": uri(gallery), "languageId": "renpy", "version": 1, "text": gallery.read_text()}
+}, is_request=False)
+rid = send("textDocument/definition", {"textDocument": {"uri": uri(gallery)}, "position": {"line": 3, "character": 11}})
+result = read_response(rid).get("result")
+check(
+    "definition of image tag 'bg' opens the image file",
+    isinstance(result, list) and result[0]["uri"] == uri(bg_room),
+    detail=json.dumps(result),
+)
+rid = send("textDocument/hover", {"textDocument": {"uri": uri(gallery)}, "position": {"line": 3, "character": 11}})
+value = (read_response(rid).get("result") or {}).get("contents", {}).get("value", "")
+check(
+    "hover on a file-defined image shows a preview",
+    "image bg room" in value and f"]({uri(bg_room)})" in value and "images/bg room.png" in value,
+    detail=value,
+)
+
+# --- quick fixes
+rid = send("textDocument/codeAction", {
+    "textDocument": {"uri": uri(gallery)},
+    "range": {"start": {"line": 5, "character": 9}, "end": {"line": 5, "character": 9}},
+    "context": {"diagnostics": []},
+})
+actions = read_response(rid).get("result") or []
+fix = next((a for a in actions if a.get("title") == "Change to 'eileen'"), None)
+check(
+    "quick fix replaces the image typo",
+    fix is not None and fix["kind"] == "quickfix"
+    and fix["edit"]["changes"][uri(gallery)][0]["newText"] == "eileen",
+    detail=json.dumps(actions),
+)
+stats_action = next((a for a in actions if a.get("kind") == "source"), None)
+ops = (stats_action or {}).get("edit", {}).get("documentChanges", [])
+check(
+    "source action writes script statistics to script_stats.md",
+    len(ops) == 2 and ops[0].get("kind") == "create"
+    and ops[0]["uri"] == uri(FIXTURE / "script_stats.md")
+    and ops[1]["edits"][0]["newText"].startswith("# Script statistics")
+    and "| Eileen (`e`) |" in ops[1]["edits"][0]["newText"],
+    detail=json.dumps(stats_action)[:400],
+)
+rid = send("textDocument/codeAction", {
+    "textDocument": {"uri": uri(broken)},
+    "range": {"start": {"line": 1, "character": 9}, "end": {"line": 1, "character": 9}},
+    "context": {"diagnostics": []},
+})
+titles = [a["title"] for a in read_response(rid).get("result") or []]
+check(
+    "quick fix creates a missing label",
+    "Create label 'missing_target' at the end of this file" in titles,
+    detail=json.dumps(titles),
+)
+
+# --- signature help
+rid = send("textDocument/signatureHelp", {
+    "textDocument": {"uri": uri(gallery)}, "position": {"line": 7, "character": 23},
+})
+help_ = read_response(rid).get("result") or {}
+sig = (help_.get("signatures") or [{}])[0]
+check(
+    "signature help inside renpy.pause(1.0, |",
+    sig.get("label", "").startswith("renpy.pause(") and help_.get("activeParameter") == 1,
+    detail=json.dumps(help_)[:300],
+)
+
+# --- document colors
+rid = send("textDocument/documentColor", {"textDocument": {"uri": uri(gallery)}})
+found = read_response(rid).get("result") or []
+check(
+    "document color for \"#c8c8ff\"",
+    len(found) == 1 and found[0]["range"]["start"] == {"line": 12, "character": 11}
+    and abs(found[0]["color"]["red"] - 200 / 255) < 1e-6,
+    detail=json.dumps(found),
+)
+rid = send("textDocument/colorPresentation", {
+    "textDocument": {"uri": uri(gallery)},
+    "color": {"red": 1, "green": 0, "blue": 0, "alpha": 1},
+    "range": found[0]["range"] if found else {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}},
+})
+presentations = read_response(rid).get("result") or []
+check("color presentation writes #ff0000", [p["label"] for p in presentations] == ["#ff0000"], detail=json.dumps(presentations))
+
+# --- dialogue statistics in hover
+rid = send("textDocument/hover", {"textDocument": {"uri": uri(script)}, "position": {"line": 4, "character": 4}})
+value = (read_response(rid).get("result") or {}).get("contents", {}).get("value", "")
+check("hover on a speaker shows dialogue statistics", "**Dialogue:** 2 lines · 6 words" in value, detail=value)
+
+# --- watched files: a new image file clears the warning for its tag
+cg_ending.write_bytes(bg_room.read_bytes())
+notifications.clear()
+send("workspace/didChangeWatchedFiles", {"changes": [{"uri": uri(cg_ending), "type": 1}]}, is_request=False)
+rid = send("workspace/symbol", {"query": "cg ending"})
+names = [s["name"] for s in read_response(rid).get("result") or []]
+cg_ending.unlink()
+latest = (diags_for(gallery) or [[]])[-1]
+check(
+    "a new image file is picked up from file watching",
+    "cg ending" in names and not any("image 'cg'" in d["message"] for d in latest)
+    and any("image 'eilen'" in d["message"] for d in latest),
+    detail=json.dumps([names, latest]),
 )
 
 # --- live re-index on change: rename label shop -> shop_two in the buffer
